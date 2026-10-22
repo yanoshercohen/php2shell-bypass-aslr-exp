@@ -6,7 +6,7 @@ This file records the new exploit chain provided by the user and the independent
 
 ## 1. New chain (user intelligence)
 
-1. The first request OOMs while decoding a large session in upload-progress, leaving `BG(unserialize).level=1` and a **freed `data`**.
+1. The first request OOMs while decoding a large session in upload-progress, leaving `BG(unserialize).level=1` and a **dangling `data` pointer to a freed object**.
 2. The second request reclaims that 8216-byte object with two 8214-byte multipart parameters.
 3. Use backslash folding to construct a valid 48-bit `data->last` pointer.
 4. The binary progress marker forges `var_entries`, turning `var_push` into a write to an address of choice.
@@ -98,7 +98,7 @@ If `data->last` is attacker-controlled, the write address is:
 = last + 16 + used_slots*8
 ```
 
-`rval` is a `zval*` (a predictable unserializer temporary address); `used_slots` can also be controlled through the reclaim content. A two-level trampoline can use the pointer written by the first write as the `last`/target of the second, ultimately overwriting `zend_object->handlers`, so that object destruction enters the one-gadget.
+`rval` is a `zval*` (a predictable unserializer temporary address); `used_slots` can also be controlled through the contents used to reclaim the allocation. A two-level trampoline can use the pointer written by the first write as the `last`/target of the second, ultimately overwriting `zend_object->handlers`, so that object destruction enters the one-gadget.
 
 ---
 
@@ -140,7 +140,7 @@ Shape (`tools/bg_b.py` / `tools/bg_b_file.py`):
 - No file: `PHPSESSID=bgsmall123`, `PHP_SESSION_UPLOAD_PROGRESS=pwn`, two 8214-byte fields `p1`/`p2` (10-character boundary).
 - END cleanup runs before RINIT and calls `php_session_initialize` → `s_read` → `php_var_unserialize_init`, reusing the stale `BG.data`.
 
-Measured gdb:
+gdb observations:
 
 ```text
 INIT level=1 data=0x7ffff5e6d000
@@ -152,7 +152,7 @@ INIT level=0 data=(nil)
 ```
 
 - `BG.level=1` and `data` is still A's address, indicating that pre-RINIT reuse succeeded;
-- the 8216 structure has been overwritten by multipart content; fields such as `data->last` have become pointers into the structure (0x...6d030/6d020/6d000/6d040);
+- the 8216-byte structure has been overwritten by multipart content; fields such as `data->last` have become pointers into the structure (0x...6d030/6d020/6d000/6d040);
 - In the version with a file (`bg_b_file.py`), during FILE_START decoding the structure is reclaimed by multipart header content such as `a.bin`/`Content-`, and decoding then crashes while dereferencing `last_dtor` at `tmp_var`:
 
 ```text
@@ -223,9 +223,9 @@ end
 
 ## 5. Relation to the old documents
 
-- The custom-PHP exploitation via `session_unset`/`session_encode` in Sections 3/10 of `NOTES.md` is **no longer a valid deliverable**; it demonstrated Defect D/leak mechanisms but violates the current constraint of "no target-side-specific PHP, pure HTTP".
+- The custom-PHP exploitation via `session_unset`/`session_encode` in Sections 3/10 of `NOTES.md` is **no longer a valid deliverable**; it demonstrated Defect D/leak mechanisms but violates the current constraint of "no target-specific PHP, pure HTTP".
 - The old exploit pages have been moved to `~/php-lab/offline/`, and the webroot retains only a plain `index.php`.
-- The new approach continues to be based on the `BG(unserialize)` UAF; the next core step is the precise layout of the 8216 structure fields and the two-level `var_push` write.
+- The new approach continues to be based on the `BG(unserialize)` UAF; the next core step is the precise layout of the fields in the 8216-byte structure and the two-level `var_push` write.
 
 ---
 
@@ -264,9 +264,9 @@ Conclusion: in our post-RINIT A scenario, **the 8216-byte `php_unserialize_data`
 
 ### Next steps (RCE)
 
-1. **Keep the 8216 chunk as a large free block** instead of splitting it into small bins:
+1. **Keep the 8216-byte block as a large free block** instead of splitting it into small bins:
    - try different ways of ending A (pre-RINIT OOM without shutdown vs post-RINIT shutdown; `unclean_shutdown`/`report_memleaks` flags), so that heap recycling at B startup leaves the chunk on the large-free list;
-   - or allocate an 8193/8215 large buffer at the very beginning of B (front-loading the two 8214-byte parameters) to occupy the chunk before the small-bin split.
+   - or allocate an 8193/8215-byte large buffer at the very beginning of B (front-loading the two 8214-byte parameters) to occupy the chunk before the small-bin split.
 2. Once `data->last` is controllable:
    - set `last_dtor=0` so `tmp_var` takes the `emalloc` branch;
    - forge `var_entries` (`used_slots`, `next`, `data[]`) in the parameter buffer/adjacent large chunk, and set the write target of `var_push` to `zend_object->handlers`;
@@ -287,7 +287,7 @@ Source verification results:
 PHPAPI void php_var_unserialize_destroy(php_unserialize_data_t d) {
     if (BG(serialize_lock) || BG(unserialize).level == 1) {
         var_destroy(&d);
-        efree(d);                 // free the 8216 chunk
+        efree(d);                 // free the 8216-byte block
     }
     if (!BG(serialize_lock) && !--BG(unserialize).level) {
         BG(unserialize).data = NULL;
@@ -303,12 +303,12 @@ Locations of `BG(serialize_lock)++/--`:
 - before and after class lookup/autoload/unserialize_callback_func calls (around lines 1232/1256/1268);
 - `ext/standard/var.c` 855/876: serialize magic methods.
 
-Therefore the attack chain's first request must be: **the session data contains an object whose `__wakeup`/`__unserialize` (or autoload/unserialize_callback_func) triggers OOM during decoding**. The OOM's `zend_bailout` skips `BG(serialize_lock)--`; the outer destroy then sees lock=1, calls `efree(d)` but does not clear BG, leaving a large-free dangling 8216 chunk.
+Therefore the attack chain's first request must be: **the session data contains an object whose `__wakeup`/`__unserialize` (or autoload/unserialize_callback_func) triggers OOM during decoding**. The OOM's `zend_bailout` skips `BG(serialize_lock)--`; the outer destroy then sees lock=1, calls `efree(d)` but does not clear BG, leaving a dangling 8216-byte block on the large-free list.
 
 In our lab, the large session contains only arrays/strings (progress data generated by upload-progress), with no object magic methods, so:
 
 - Normal decode OOM: destroy never executes, `d` is still allocated (in our earlier pre-RINIT A, the `data` memory was intact);
-- post-RINIT OOM + request shutdown: the whole heap is recycled, the 8216 chunk is split into 16-byte small bins (confirmed by watchpoint), and the 8214-byte parameters cannot reclaim it as a whole block.
+- post-RINIT OOM + request shutdown: the whole heap is recycled, the 8216-byte block is split into 16-byte small bins (confirmed by watchpoint), and the 8214-byte parameters cannot reclaim it as a whole block.
 
 **Conclusion: this chain is unreachable on "vanilla session page + array session constructed over pure HTTP"; it requires the target application to put an object with `__wakeup`/`__unserialize` into the session (or to configure autoload/unserialize_callback_func).** This is an application-layer dependency that B request parameters cannot supply.
 

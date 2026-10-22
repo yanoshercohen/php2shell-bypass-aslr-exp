@@ -19,7 +19,7 @@ PS(send_cookie)=1
 +
 php_session_reset_id() fails (so send_cookie is not cleared)
 +
-A OOMs at pre-RINIT, leaving PS(id) dangling
+A runs out of memory before RINIT, leaving PS(id) dangling
 ```
 
 The original implementation used `max_input_vars` warning output to set `SG(headers_sent)` to 1,
@@ -29,7 +29,7 @@ making `php_session_send_cookie()` return FAILURE. `php_error_docref` is governe
 
 ---
 
-## 2. Alternatives verified infeasible
+## 2. Alternatives found to be infeasible
 
 ### 2.1 `Expect: 100-continue`
 
@@ -129,7 +129,7 @@ RESET send=0 ...
 - `size` has reached ~5.9M, but `real_size` is only 3 chunks = 6M, and
   `rem = limit - real_size = 2MB`, exactly enough for one more new chunk;
 - the 128B bin (`free_slot[11]`) is empty;
-- the cookie's 128B page allocation still succeeds (from a free page in an existing chunk or from the new chunk).
+- the allocation of a page for the cookie's 128B bin still succeeds (from a free page in an existing chunk or from the new chunk).
 
 At V=3200, the padding field's `php_sapi_filter → zend_string_init(3200)`
 OOMs **before FILE_START**:
@@ -163,7 +163,7 @@ CHUNK 3 free_pages=4
 
 - `rem=0`: no new chunk will be taken;
 - the 128B bin is empty: the cookie needs a new page;
-- but **72 free pages remain** across the four chunks, and the cookie's 128B page is successfully
+- but **72 free pages remain** across the four chunks, and the page for the cookie's 128B bin is successfully
   allocated from the free pages of chunk 2/3 → `send_cookie` is cleared; only A's later
   allocations OOM (id dangling, but send_cookie=false).
 
@@ -187,7 +187,7 @@ free_slot[11] == NULL
 all chunks free_pages == 0
 ```
 
-This makes the cookie's 128B page allocation fail and leaves `send_cookie` at 1.
+This makes the allocation of a page for the cookie's 128B bin fail and leaves `send_cookie` at 1.
 
 ---
 
@@ -265,7 +265,7 @@ Next steps (in priority order):
 
 ### 5.2 64B geometry: one page short of a hit
 
-After fixing the missing multipart blank line, measured 64B B forge raw buffers:
+After fixing the missing multipart blank line, the measured addresses of B's 64B forge raw buffers were:
 
 ```text
 b_forge64_first (2 39B headers + forge 63B, forge part first):
@@ -293,7 +293,7 @@ NH=660  RESET send=1 free=3  SEND0=0  POST id=0 send=false
 NH=670  NO_RESET
 ```
 
-reset is reachable and the cookie may fail, but A's child is replaced after shutdown and
+Reset is reached and sending the cookie may fail, but A's child is replaced after shutdown and
 `PS(id)/send_cookie` are lost. Completing 64B alignment requires:
 
 1. keeping A's child alive around N64E=64 (change NH/NS/N128, or place the early
@@ -317,7 +317,7 @@ reset is reachable and the cookie may fail, but A's child is replaced after shut
   - K 39B live + 1 63B raw field at the end (LIFO makes the id take the raw slot):
     for K=1..16 with NH=570+K, the child never retains the id;
   - `N64E=64` fills all 64 64B slots on 0x6e; with NH=632..660 reset is reached and the
-    cookie may fail, but the A child is replaced after shutdown, post id=0.
+    cookie send may fail, but A's child is replaced after shutdown, post id=0.
 
 Conclusion: the A primitive is stable, and B's 64B forge is only one page off; but making A's id land at
 0x6f000/0x6f100 while keeping the child alive, or making B's 64B bin capture 0x6e,
@@ -329,7 +329,7 @@ display_errors path.
 
 ---
 
-## 5. Remaining page consumption strategy
+## 5. Strategy for consuming the remaining pages
 
 The 72 free pages (288KB) need to be consumed **after the filename and before reset**, but
 without a transient peak exceeding the free pages. Verified limits:
@@ -359,7 +359,7 @@ Feasible directions (in priority order):
      these 69 pages one by one; e.g. spread the value sizes of the 997 padding fields across multiple bins
      so that each bin's current page is exactly filled and the next field triggers a new page.
    - each new bin page consumes 1 free_page; the goal is `sum(free_pages)==0` at the first reset,
-     after which the cookie's 128B new-page allocation fails.
+     after which allocation of a new page for the cookie's 128B bin fails.
    - the 2× peak of a single field still constrains total live memory; using multiple medium fields and letting
      the raw buffer be freed between fields allows incremental progress.
 
@@ -437,7 +437,7 @@ W1=924933 chunk=0x0 attempt=3
 HEAP_LEAK_FAILED
 ```
 
-To verify the RCE proper, this session temporarily changed `display_errors`
+To verify the command-execution stage, this experiment temporarily changed `display_errors`
 in `/etc/apache2/conf-enabled/php8426.conf` on `.103` from `0` to `1`; after the run it was restored to `0`
 and `apache2ctl -k restart` was executed; currently `curl 127.0.0.1:8088/index.php` returns `OK`.
 
@@ -471,11 +471,11 @@ is the complete chain under the reference configuration (`display_errors=On`).
 
 ---
 
-## 9. Latest positioning of the pure-HTTP B (2026-10-21 20:30)
+## 9. Latest findings on the pure-HTTP B request (2026-10-21 20:30)
 
 ### 9.1 Call site that steals page 0x6e
 
-On `.112`, using `tools/slowbins.gdb` (break `zend_mm_alloc_small_slow`), caught B's 16B slow path:
+On `.112`, `tools/slowbins.gdb` (with a breakpoint on `zend_mm_alloc_small_slow`) captured B's 16B slow path:
 
 ```text
 SLOW bin=1 map6e=0x0
@@ -498,8 +498,8 @@ A's id pointer is `0x…6e080`; in B's 24B page, `ZSTR_LEN` is at
   `0x6e090 = 0x…6e080` (16B free-list next), and B's response is empty
   (`php_url_encode` reads a huge len → OOM/bailout).
 
-Root cause: multipart headers are C strings. The little-endian first byte of `len=0x1000`,
-`0x00`, is truncated by `smart_string_appends`/`strlen`; and a 24B allocation requires a value length of 17–23, whose first 8 bytes cannot simultaneously be non-zero and form a small integer. A raw buffer from a body value can be binary-safe, but it is freed immediately after registration and the first 8 bytes are overwritten by the free-list next; the 24B forgery path is essentially blocked.
+Root cause: multipart headers are C strings. The first byte of the little-endian representation of `len=0x1000` is
+`0x00`, so `smart_string_appends`/`strlen` truncate the value at that byte; and a 24B allocation requires a value length of 17–23, whose first 8 bytes cannot simultaneously be non-zero and form a small integer. A raw buffer from a body value can be binary-safe, but it is freed immediately after registration and the first 8 bytes are overwritten by the free-list next; the 24B forgery path is essentially blocked.
 
 ### 9.3 A id page scan
 
@@ -517,7 +517,7 @@ A's 64B page is 0x6e/0x83/chunk1; the two have no stable intersection.
 
 ### 9.4 Conclusion
 
-- The 1day RCE proper has been proven end-to-end under the `display_errors=On` reference configuration (Section 8);
+- The 1-day RCE chain itself has been demonstrated end-to-end under the `display_errors=On` reference configuration (Section 8);
 - the `display_errors=Off` A primitive holds, but the B leak is still stuck on Zend MM page allocation:
   A's id page (64B) and the 64B/32B/24B pages B can obtain do not coincide, and 24B
   C-string forgery is limited by NUL;

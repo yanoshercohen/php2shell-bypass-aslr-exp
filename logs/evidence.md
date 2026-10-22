@@ -8,8 +8,8 @@ Remote `/tmp/x`:
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-5 consecutive times (same no-ASLR configuration, prefork rebuilds after a
-worker crash):
+5 consecutive successful runs (same no-ASLR configuration; prefork respawns the
+worker after each crash):
 
 ```text
 RUN 1 OK: uid=33(www-data) gid=33(www-data) groups=33(www-data)
@@ -81,7 +81,7 @@ That crash occurred when clean read bucket0 key (overwritten by the spray block
 to `0x100000001`); only after adjusting the layout (keeping bucket0 key=0) did
 it enter the fake zval/fake HashTable and hit system.
 
-## 6. upload_progress A/B line (current crash state)
+## 6. upload_progress A/B research track (current crash behavior)
 
 Request A: multipart + `PHP_SESSION_UPLOAD_PROGRESS` + file + 12MB field:
 
@@ -111,6 +111,6 @@ ARR_DESTROY arr=0x7ffff5e02150 flags=8 numused=0
 SIGSEGV in _IO_new_fclose(fp=0xffffffff)
 ```
 
-This line is currently a confirmed cross-request state residue + repeatable
-crash; the 320-byte controllable re-occupation/fake HashTable still needs to be
-connected.
+This approach has confirmed state persisting across requests and a repeatable
+crash; it still needs to be combined with controlled reuse of the 320-byte
+allocation and a fake HashTable.

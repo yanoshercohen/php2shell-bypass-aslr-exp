@@ -1,13 +1,13 @@
 # Pure HTTP ASLR chain: research notes on the rotation problem
 
 Date: 2026-10-21
-Reference delivery: [ASLR_PURE_HTTP.md](ASLR_PURE_HTTP.md) (someone else has already achieved 5/5, using
+Reference implementation: [ASLR_PURE_HTTP.md](ASLR_PURE_HTTP.md) (someone else has already achieved 5/5, using
 SIGSEGV to rotate the worker between stages)
 Constraints: attack requests use HTTP only; **no instrumentation is performed on the target 172.16.0.103**
 (no gdb, no /proc reads, no target-side PHP). All gdb measurements in this document were performed on
 **our own calibration lab 172.16.1.112** and did not touch the target process.
 
-Status: **the address leaks and the RCE terminal are already pure HTTP; the only remaining engineering
+Status: **the address leaks and the RCE execution endpoint are already pure HTTP; the only remaining engineering
 item is "how to rotate the worker between stages with a single HTTP request"**. This has not yet been
 made to work; this document records the blocker and the next steps.
 
@@ -102,7 +102,7 @@ VALUE Set-Cookie: PHPSESSID=%10...P%3CaP%EA%7F...
 
 In this run stage 2 instead succeeds on the same worker, which shows:
 
-- rotate's crash request does not trigger under used history;
+- rotate's crash request does not trigger after earlier requests have changed the worker's state;
 - stage 2 does not depend on a fresh worker (consistent with 1.2).
 
 ---
@@ -120,7 +120,7 @@ In this run stage 2 instead succeeds on the same worker, which shows:
 - The 55B fake-ref raw from B `send_b_zif 15 2 ...` lands exactly here;
   the fake reference's fields are at raw+0x10, aligned with `R0`.
 
-### 3.2 Geometry of used history is completely different
+### 3.2 The layout after earlier requests is completely different
 
 First perform stage 1 + stage 2 on the same worker, then send stage 3 A:
 
@@ -139,7 +139,7 @@ Conclusion:
 1. **Under used history, `R0` falls on a 32B bin page**, not a 56B page;
 2. `send_b_zif`'s fake-ref raw is 55B → 56B bin, so it **cannot be allocated into a 32B page**;
 3. Even if P moves `R0` to a page-aligned 56B slot (for example, `R0-0x10=chunk+0x15b0` at P=7),
-   that page is still a 32B bin at B time (`map=0x80000003`), and the 56B raw still cannot get in;
+   that page is still a 32B bin at B time (`map=0x80000003`), and the 56B raw buffer still cannot be allocated there;
 4. At P=640 the `R0` page is even FRUN (the whole page is free), yet the current head of the 56B bin is still
    `chunk+0x24d0`; the allocator will not take that high-address free page for a few dozen 56B allocations.
 
@@ -271,17 +271,17 @@ python3 send_b_zif.py 15 2 $HT $ZIF 'id>/tmp/p1'
 | `tools/pagemap.gdb` | Reads the `chunk->map` / free_slot of the R0 page on .112 |
 | `tools/send_b_probe.py` / `b_probe_long.py` | Fake-ref landing-site probes |
 | `tools/same_worker_trials.py` | Same-worker stage 3 P scan (.112) |
-| `tools/pure_aslr_run.sh` | Someone else's driver (includes HTTP rotate, unstable on used) |
+| `tools/pure_aslr_run.sh` | Someone else's driver (includes HTTP rotate, unstable on workers that have already served requests) |
 
 ---
 
 ## 8. Conclusion
 
-- **The attack requests, both address leaks, and the `zif_system` terminal are already pure HTTP**;
+- **The attack requests, both address leaks, and the `zif_system` execution endpoint are already pure HTTP**;
 - In the recorded 5/5, inter-stage rotation used SIGSEGV; the script's HTTP `rotate()`
   is reliable only on a fresh worker and does not trigger on a worker that has served leaks;
-- The root cause under used history is that `R0` lands on a 32B bin page, while the fake-ref raw of
-  fresh stage 3 is 56B bin; the page is not re-split, so the landing-site geometry does not hold;
+- The root cause under used history is that `R0` lands on a 32B bin page, while the fake-ref raw buffer for
+  fresh stage 3 belongs to the 56B bin; the page is not re-split, so the landing-site geometry does not hold;
 - The shortest path to close the gap is: **stage 1+2 on the same worker → use `b_crash7` (32B) for a
   pure HTTP crash → run the existing stage 3 on fresh W2**. crash7's N must be
   calibrated for used history, and the old reference must first be confirmed to still exist after A.

@@ -13,7 +13,7 @@ Constraints: fully remote, sending only ordinary multipart HTTP; the target page
 Under `display_errors=0` we have now achieved the **OOM-in-cookie primitive that does not depend on warning output**:
 
 1. Request A OOMs inside `php_session_send_cookie()`, at the first
-   `zend_string_safe_alloc(3, 32, 0, 0)` of `php_url_encode()` (121B → bin 128);
+   `zend_string_safe_alloc(3, 32, 0, 0)` allocation in `php_url_encode()` (121B → bin 128);
 2. The OOM occurs after `PS(send_cookie)=1` and before `PS(send_cookie)=0`;
    the request bails out, leaving `PS(id)` (a 32-character random id) and `PS(send_cookie)=1` behind;
 3. No PHP warning or output is involved; `SG(headers_sent)` remains 0 throughout;
@@ -22,7 +22,7 @@ Under `display_errors=0` we have now achieved the **OOM-in-cookie primitive that
    and calls `php_session_send_cookie()` with the **dangling `PS(id)`** (the `RESET_ID`/`SEND_COOKIE`
    breakpoints have been hit in practice, `send_cookie=1`).
 
-The remaining step is for B to reoccupy the dangling id block with a forged `zend_string` header (so that `url_encode` reads a controlled large length), while also making `php_rshutdown_session_globals()` release that id without triggering `zend_mm_panic`. **This step is also complete**: B uses two large fields to lay out the cached id chunk through page 510, so that the second field's live copy lands exactly on pages 257–511, and writes the forged header plus the trailing uninitialized region at the corresponding offset in page 511; `url_encode` reads out 4000 bytes, of which the last 3000 bytes are the bin-64 freelist pointers left by A at the tail of page 511.
+The final step was for B to reoccupy the dangling id block with a forged `zend_string` header (so that `url_encode` reads a controlled large length), while also making `php_rshutdown_session_globals()` release that id without triggering `zend_mm_panic`. **This step is also complete**: B uses two large fields to lay out the cached id chunk through page 510, so that the second field's live copy lands exactly on pages 257–511, and writes the forged header plus the trailing uninitialized region at the corresponding offset in page 511; `url_encode` reads out 4000 bytes, of which the last 3000 bytes are the bin-64 freelist pointers left by A at the tail of page 511.
 
 Measured (`display_errors=0`):
 
@@ -92,7 +92,7 @@ e_id = php_url_encode(ZSTR_VAL(PS(id)), ZSTR_LEN(PS(id)));
 start = zend_string_safe_alloc(3, len, 0, 0);   // len = 32
 ```
 
-Request size = `24 + 3*32 + 1 = 121` → **bin 128** (one-page run, 32 slots).
+Allocation size = `24 + 3*32 + 1 = 121` → **bin 128** (one-page run, 32 slots).
 It is enough to satisfy both of the following at the `send_cookie` entry:
 
 - `heap->free_slot[11] == NULL` (bin 128 empty)
@@ -117,7 +117,7 @@ F=0  S=62  NB=235  BL=15000  X=208  K=0  KL=4000  FL=103
 - **NB×BL = 235 × 15000B**: large fields fill memory; each value has two live copies
   (`IF_G(post_array)` + `$_POST`), each one `25+15000` → 4 pages, 8 pages per field.
 - **X=208 values of 231B**: bin 256 (16 slots/page); each field has 2 live slots + 1 transient
-  raw slot; every 8 fields triggers a new 256B run (1 page), used for one-page-granularity finishing.
+  raw slot; every 8 fields trigger a new 256B run (1 page), used to consume the remaining memory one page at a time.
 
 ### 3.2 gdb evidence
 
@@ -206,7 +206,7 @@ SEND_COOKIE id=0x7ffff3fff000 len=32 ... free_pages=370 ...
 
 ### 4.3 Remaining crash: rshutdown releasing the dangling id
 
-`MULTIPART_EVENT_END` unconditionally executes after cleanup:
+After cleanup, the `MULTIPART_EVENT_END` handler unconditionally executes:
 
 ```c
 php_rshutdown_session_globals();
@@ -278,7 +278,7 @@ data  at D    : 'M' * 1000, after which the value ends (L2 = D+1000)
 
 BF's allocation size `25 + L2 = 1,041,409` → 255 pages (exactly aligned with pages 257–511).
 The value data is written only up to 1000 bytes inside page 511; the following ~3000 bytes are uninitialized,
-retaining the bin-64 freelist pointers at the tail of page 511 from A's era.
+retaining the bin-64 freelist pointers at the tail of page 511 from request A.
 
 ### 5.4 Measured result
 
@@ -356,7 +356,7 @@ and **cannot go past this chunk** (the addresses beyond are unmapped). So:
 ### 6.2 Experiments already done
 
 - **Late large field**: insert a 50/100-page field before the X trimmer, and after its raw buffer is freed, try to leave a hole in the main chunk. Measured: with NB=235 it OOMs directly; with NB=215/208 it reaches `send_cookie`, but the id is still in the 0x3e/0x3d chunk and `url_encode` still does not land at the OOM point (`free_pages > 0`). The reason is that the raw buffer's two live copies push steady-state memory to the limit, and the pages freed from the raw buffer are not enough to become the only last page.
-- **arData's 513th expansion**: pushing the 513th insert to the end of X OOMs (it needs
+- **arData expansion on the 513th insertion**: pushing the 513th insert to the end of X OOMs (it needs
   10 contiguous pages); pushing it into the middle of the bigs causes the 4-page hole from the old arData to be consumed exactly by the 4-page copy of the subsequent big value.
 - **Conclusion**: completing stage-2 requires explicit three-stage heap shaping — "fill the main chunk with live copies + leave page 511 free in the id chunk + land a bin-56 run on 511"; this is the next calibration task and cannot be solved by tuning a single parameter.
 
@@ -425,15 +425,15 @@ Currently A's `PS(id)=page128+0x80` is exactly **slot 2 + 0x10** of a bin-56 run
    `zend_mm_panic` or SIGSEGV. No field sequence has yet been found that satisfies both
    "page 127 slot5 safe + page 128 bin-56 run slot2 is a HashTable".
 
-These two points are pure calibration issues for stage-2; the stage-3 `zif_system` terminal
+These two points are pure calibration issues for stage-2; the stage-3 `zif_system` execution endpoint
 (`pDestructor=zif_system`, fake execute_data) can reuse `send_b_zif.py` directly once stage-2 provides the
 libphp base, with only the fake HT/fake-ref addresses re-calibrated for the new shape.
 
 ### 6.5 stage-3
 
-The `zif_system` terminal (`pDestructor=zif_system`, fake execute_data) does not depend on
+The `zif_system` execution endpoint (`pDestructor=zif_system`, fake execute_data) does not depend on
 libc; once stage-2 provides the libphp base, the payload from `send_b_zif.py` can be reused directly,
-needing only that the fake HT address and fake-ref landing site be re-calibrated for the 0 chain's A/B shapes.
+requiring only recalibration of the fake HT address and fake-ref landing site for the 0 chain's A/B shapes.
 
 
 ## 7. Files and commands
@@ -443,7 +443,7 @@ needing only that the fake HT address and fake-ref landing site be re-calibrated
 | `tools/send_a_oom5.py` | A: S fields with 103B names/8B values + NB large fields + X 231B values + file part; optional `AQ_N/AQ_LEN` GET padding, `WARM_LEN`, `W64_LEN` (bin-64 shift) |
 | `tools/send_b_open.py` | B: N 231B values + PHPSESSID + PROGRESS, no file part; `BB1_LEN` page layout, `BF_P1/BF_READ` forge, `BVAL_OFF/BVAL_LEN` in-value forged len, `BUNIQ/DUP_*` unique values/duplicate-name fields, `NEST_*` nested arrays, `TAIL231/232` tail fields; optional Cookie/Header/GET padding |
 | `tools/trial_bins.sh` | A-only calibration (restart + gdb + send A) |
-| `tools/trial_ab.sh` | fresh worker + gdb breakpoint resolution, then send A/B; with `ASLR_ON=1`, does not enable `setarch -R` |
+| `tools/trial_ab.sh` | fresh worker + gdb breakpoint setup, then send A/B; with `ASLR_ON=1`, does not enable `setarch -R` |
 | `tools/g_bins.gdb` | gdb probes: `SEND_COOKIE`, `OPEN_FILES`, `RESET_ID`, `RSHUT_ID`, `MM_SAFE_ERROR`, chunk/page map, cached chunks, bin15 free-slot stats |
 | `logs/oomcookie_A_20261021.log` | A's gdb evidence (exact OOM landing site) |
 | `logs/oomcookie_AB_20261021.log` | A+B evidence (getting past mod_data, B's send_cookie, old-shape rshutdown panic) |

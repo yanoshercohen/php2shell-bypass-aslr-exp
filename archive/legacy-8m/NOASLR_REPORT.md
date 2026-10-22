@@ -91,7 +91,7 @@ Stable addresses under no-ASLR:
 
 ### 3.1 Raw buffer reclaiming the old reference
 
-Multipart normal-field values are first read by `multipart_buffer_read_body()` into a
+Values of ordinary multipart fields are first read by `multipart_buffer_read_body()` into a
 **raw buffer** from `erealloc(NULL, len+1)`; content starts at offset 0, and the buffer is only
 `efree()`d after callbacks/registration; the content remains after free. Field value length 55 is chosen (allocates 56B, Zend MM bin 6).
 
@@ -157,7 +157,7 @@ python3 send_a_ps.py 17 19 3 12
 # boundary 17B, PHPSESSID 19B, progress key 3B, large field 12MB
 ```
 
-A's purpose: OOM while decoding upload-progress, leaving a cross-request dangling reference.
+A's purpose: trigger OOM during session decoding in upload-progress, leaving a cross-request dangling reference.
 After A finishes, the worker can still handle B (in this lab the session RSHUTDOWN is skipped).
 
 Request B (`send_b_rce2.py`):
@@ -226,8 +226,8 @@ SYSTEM rdi=0x7ffff5e6e118 [id>/tmp/p1]
    is enabled by default and cleanup defaults to On.
 3. **Worker aborts after request B**: after `system` returns, `pefree(HT_GET_DATA_ADDR)` in
    `zend_hash_destroy` frees the string's interior pointer, Zend MM detects heap corruption and
-   aborts. The proof has already been written; to continue exploiting the same process, the fake HT must be placed in a legally freeable
-   allocation chunk or nTableMask must be fixed so that `HT_GET_DATA_ADDR` is the allocation start.
+   aborts. The proof has already been written; to continue exploiting the same process, the fake HT must be placed in a valid
+   allocation block that can be freed safely or nTableMask must be fixed so that `HT_GET_DATA_ADDR` is the allocation start.
 4. **Depends on B's exact 56B/192B allocation order**: N1=7, field-name length 31, L=167/L=55,
-   boundary 10 are the measured combination; a different PHP build/configuration/request order requires recalibration.
+   and boundary length 10 form the tested combination; a different PHP build/configuration/request order requires recalibration.
 5. **No application code involved**: the target page needs no session calls; the trigger is in the RINIT/parse stage.

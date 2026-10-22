@@ -99,7 +99,7 @@ Two problems need to be solved:
      NUL at b3=0, again depends on the base byte. There is currently no usable
      gadget that falls in the same 64KB.
    - libphp imports only `popen` (`objdump -T` shows this) and does not import `system`;
-     `popen@plt` also requires the libphp base, and the second argument, rsi, is not controllable.
+     `popen@plt` also requires the libphp base, and the second argument in rsi is not controllable.
    - The earlier `zend_call_function → zif_system` lead requires a forged FCI and belongs to
      another chain that needs the libphp base.
 
@@ -272,7 +272,7 @@ reentrancy gadget is still needed, and none has been found yet.
 2. **Fuzz built-in `Serializable` class handlers**: the `unserialize()` C implementations of `ArrayObject`,
    `SplObjectStorage`, `DateTime`, `SimpleXMLElement`, `ZipArchive`,
    `Phar`, etc., looking for out-of-bounds reads/paths that print input in warnings.
-   Note that the default configuration currently cannot inject `C:`/`O:` into the session, so this line
+   Note that the default configuration currently cannot inject `C:`/`O:` into the session, so this approach
    is meaningful only with `php_serialize` or application-controllable session data.
 3. **Progress data values**: confirm whether `field_name`/`name`/`tmp_name` are
    printed by `%.*s` on any error path; none has been found in the source so far.
@@ -364,7 +364,7 @@ and does not enter `zend_array_destroy`; therefore, a reference had to be forged
 - When A0=0x3268, pDestructor is at A0+0x30=0x3298, which has already crossed into the **next
   320B slot** (0x3280); measurement shows that B's 320B allocation overwrites this location with
   `0xffff...`, losing the old real `zval_ptr_dtor`.
-- If A's SID is changed to 1..5, A0=0x3230 and pDestructor falls within the same
+- If A's SID length is changed to 1..5, A0=0x3230 and pDestructor falls within the same
   320B slot; however:
   - To overwrite/control gc/flags/arData, the 320B string length must be ≥257, while
     pDestructor is at data offset 0x108=264, so the string copy **completely overwrites**
@@ -480,4 +480,4 @@ pDestructor  = A0+0x30 = slot2 data + 0xa8
 - a write primitive that “writes only a prefix without a NUL” is still missing, as is a relative pointer that can make
   arData point to controlled data.
 
-This line of work is not yet closed; no-ASLR RCE remains the only verified code execution.
+This approach has not yet produced an end-to-end result; no-ASLR RCE remains the only verified code execution.

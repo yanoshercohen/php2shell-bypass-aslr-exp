@@ -3,7 +3,7 @@
 Date: 2026-10-21
 Target: PHP 8.4.26 + Apache 2.4.68 prefork + mod_php (Debian 12 amd64, `172.16.0.103`)
 Constraints: **fully remote, HTTP only; the target webroot contains only ordinary pages (no dedicated PHP file)**.
-Status: **The full ASLR-on chain works end to end, and every attack request in the chain is pure HTTP: 9/10 in the lab (with initial rotation) / 5/5 (without)**. Addresses come from two pure HTTP leaks (Zend MM chunk base, libphp base); the terminal uses `zif_system` (no libc needed). Worker rotation between stages is also triggered over HTTP: `A_bigfields` (3MB live POST field + OOM) corrupts the Zend MM heap, and an immediately following B request that initializes a session makes the child `SIGABRT`, whereupon prefork forks a new worker with an identical address space.
+Status: **The full ASLR-on chain works end to end, and all attack requests in the chain use only HTTP: 9/10 in the lab (with initial rotation) / 5/5 (without)**. Addresses come from two pure HTTP leaks (Zend MM chunk base, libphp base); the execution endpoint uses `zif_system` (no libc needed). Worker rotation between stages is also triggered over HTTP: `A_bigfields` (3MB of live POST fields + OOM) corrupts the Zend MM heap, and an immediately following B request that initializes a session causes the child to terminate with `SIGABRT`, whereupon prefork forks a new worker with an identical address space.
 
 > Terminology: "pure HTTP" in this document means the **attack request chain** uses only HTTP. The lab driver still restarts Apache once at the start to obtain a clean master and uses `cat /tmp/p1` to verify the result; these two steps are lab-environment operations and are not part of the attack chain. The attack chain itself (leak, rotation, execution) contains no local signals.
 
@@ -11,7 +11,7 @@ Status: **The full ASLR-on chain works end to end, and every attack request in t
 
 ## 1. Conclusion
 
-Three request sequences (each an ordinary multipart POST to `index.php`):
+Three request sequences (each request is an ordinary multipart POST to `index.php`):
 
 | Stage | Request A | Request B | Output |
 |---|---|---|---|
@@ -128,11 +128,11 @@ B (`b_target.py 443 16 983`):
 
 ---
 
-## 3. Stage 3: `zif_system` terminal
+## 3. Stage 3: `zif_system` execution endpoint
 
 ### 3.1 Why not libc
 
-Stages 1/2 leaked only the heap and libphp; the chunk scan found no libc pointers. The terminal therefore uses
+Stages 1/2 leaked only the heap and libphp; the chunk scan found no libc pointers. The execution endpoint therefore uses
 PHP's own internal function handler `zif_system` (libphp + `0x43a870`) and does not
 need a `system`/libc address.
 
@@ -195,7 +195,7 @@ php_session_track_init()
   - 6 pads make the dangling reference `R0 = chunk + 0x24e0`,
     and `R0-0x10` is the start of a 56B block;
 - B: `send_b_zif.py 15 2 <HTDATA> <ZIF> "id>/tmp/p1"`
-  - With `N1=15` (31-character priming field), the 55B fake-ref raw buffer lands at `R0-0x10`;
+  - With `N1=15` (priming fields with 31-character names), the 55B fake-ref raw buffer lands at `R0-0x10`;
   - `HTDATA = chunk+0x6e0d8` (live 167B string data);
   - `ZIF = libphp+0x43a870`.
 
@@ -210,7 +210,7 @@ php_session_track_init()
 
 1. Restart Apache (ASLR enabled, single-worker prefork);
 2. Stage 1: `send_a_leak2 + b_numleak2`, parse the chunk base from `Set-Cookie`
-   (2MB-aligned mode); retry 3 times on failure;
+   (the mode of the 2MB-aligned base addresses); retry 3 times on failure;
 3. Rotate the worker (HTTP): `send_a_bigfields 1001 3000 12 17` →
    `sup_poc.py b`, wait for prefork to fork a new child;
 4. Stage 2: `send_a_leak3 + b_target`, parse
@@ -258,7 +258,7 @@ raw libphp leak response: `logs/libphp_leak_20261021.resp`.
   no longer works.
 - **Pure HTTP rotation (implemented)**: `A_bigfields` sends 1001 ordinary fields (the first 1000
   are registered as `$_POST`, 3000 bytes each) → FILE_START creates a new id → the 12MB field OOMs.
-  The 3MB live string + OOM corrupts the Zend MM heap state; an immediately following B that
+  The 3MB of live strings + OOM corrupts the Zend MM heap state; an immediately following B that
   initializes a session (`sup_poc.py b`: PHPSESSID + PHP_SESSION_UPLOAD_PROGRESS, no file field,
   goes through pre-RINIT END cleanup) triggers `zend_mm_panic`/`abort()`, the child exits with
   **SIGABRT**, and prefork immediately forks a new child. Log confirmation:
@@ -283,7 +283,7 @@ raw libphp leak response: `logs/libphp_leak_20261021.resp`.
    > OOM into `php_session_send_cookie→php_url_encode` (bin 128 empty +
    > free pages exhausted), and on the B side traverses the dangling `PS(mod_data)` and calls
    > `send_cookie` with the dangling id; what remains is calibration of the forged dangling id block. See
-   > [DISPLAY_ERRORS_OFF.md](/Users/my/php2shell/DISPLAY_ERRORS_OFF.md) for details.
+   > [DISPLAY_ERRORS_OFF.md](../../DISPLAY_ERRORS_OFF.md) for details.
 2. Requires `session.use_cookies=1` (default), `session.use_strict_mode=0`
    (default), `max_input_vars=1000` (default), and `memory_limit=8M` (lab).
 3. All chunk/module-internal offsets are tied to this PHP 8.4.26 build and request shapes:
@@ -302,7 +302,7 @@ raw libphp leak response: `logs/libphp_leak_20261021.resp`.
 4. After command execution the worker crashes in the final `pefree` of `zend_hash_destroy`;
    the proof has already been written, matching the expectation for a one-shot exploit.
 5. The A shapes for stages 1 and 2 differ, but both build on the same "headers_sent + empty
-   PHPSESSID + OOM" primitive; both require A to be a fresh request on the worker. Freshness is ensured by
+   PHPSESSID + OOM" primitive; both require A to be the worker's first request. Freshness is ensured by
    HTTP rotation: `send_a_bigfields.py 1001 3000 12 17` (~3MB field request body)
    + `sup_poc.py b`. This rotation relies on `memory_limit=8M` to make the 12MB field OOM and on the
    next request aborting during Zend MM cleanup.
@@ -327,7 +327,7 @@ raw libphp leak response: `logs/libphp_leak_20261021.resp`.
 | `tools/b_target.py` | Stage 2 B (expand a0443 to 16 elements → leak pDestructor) |
 | `tools/send_a_pad.py` | Stage 3 A (6 pads + file + OOM) |
 | `tools/send_b_zif.py` | Stage 3 B (compact zif_system payload) |
-| `tools/send_b_rce2.py` | Legacy system terminal (no-ASLR baseline/crash experiments) |
+| `tools/send_b_rce2.py` | Legacy system execution endpoint (no-ASLR baseline/crash experiments) |
 | `tools/send_a_bigfields.py` | HTTP rotation A (3MB live field + OOM) |
 | `tools/sup_poc.py` | HTTP rotation B (session initialization triggers SIGABRT) |
 | `tools/b_crash7.py` | Early HTTP crash primitive experiment (7-character live string) |

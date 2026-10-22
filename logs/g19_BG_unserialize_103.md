@@ -19,8 +19,8 @@ cross-request primitive is the **pre-RINIT** session decode path:
 - Request B's pre-RINIT decode (`php_var_unserialize_init`) still sees that
   state before RINIT clears `BG(unserialize)`.
 
-This is consistent with the intel's "UAF caused by cross-request residue of
-BG(unserialize) state during the pre-RINIT phase".
+This is consistent with the supplied analysis: "UAF caused by
+`BG(unserialize)` state persisting across requests during the pre-RINIT phase".
 
 ## 2. Confirmed on 8.4.26
 

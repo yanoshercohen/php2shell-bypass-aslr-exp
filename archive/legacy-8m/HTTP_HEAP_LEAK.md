@@ -85,7 +85,7 @@ e_id = php_url_encode(ZSTR_VAL(PS(id)), ZSTR_LEN(PS(id)));
 
 Key points:
 
-1. **headers_sent must be 1**. This is achieved with the `max_input_vars` overflow warning:
+1. **headers_sent must be 1**. This is achieved with the warning about exceeding `max_input_vars`:
    `main/php_variables.c` calls
    `php_error_docref(NULL, E_WARNING, "Input variables exceeded ...")` when the variable count exceeds 1000;
    the lab has `display_errors=On`, so the warning is written to the response and sets `SG(headers_sent)=1`.
@@ -135,9 +135,9 @@ B's multipart parsing re-pages the chunk at request startup. Calibration found t
 **80-byte bin page** in B's layout:
 
 1. First send N fields with value length 48 (`zend_string` = 24+48+1 = 73 → 80B bin).
-   Each field leaves a **live** 80B string that occupies blocks in free-list order.
+   Each field leaves a **live** 80B string; these strings occupy blocks in free-list order.
 2. Using a unique 48-character value per field (`v%04d` + `x`), it is possible to read out “which block lands at the stale address”:
-   under this lab, with `N=998`, the `Set-Cookie` value is `v0892...`, meaning the string from field 893 lands in that block.
+   in this lab, with `N=998`, the `Set-Cookie` value is `v0892...`, meaning the string from field 893 lands in that block.
 3. Instead, send **892** priming fields and then 1 forge field with a **79-byte value**:
    - raw buffer size 79+1 = 80 → 80B bin;
    - its value `zend_string` is 24+79+1 = 104 → 112B bin (does not occupy an 80B block);
@@ -145,7 +145,7 @@ B's multipart parsing re-pages the chunk at request startup. Calibration found t
    Raw buffer content layout (block start is S, `PS(id)=S`):
 
    ```text
-   S+0x00: gc (overwritten by the efree'd free-list next; no effect)
+   S+0x00: gc (overwritten by the free-list next pointer after efree; no effect)
    S+0x08: h (arbitrary)
    S+0x10: len = 0x1000 (forged)
    S+0x18: data[0] = 'L', followed by padding
@@ -274,7 +274,7 @@ B: send_b_rce2.py 16 2 0x7ffff5e6e0d8 0x7ffff7d14490 "id>/tmp/p1"
    containing only heap pointers; a large 1MB leak (verified to be sendable) still shows only heap pointers, with no
    libphp/libc code pointers.
 6. If len reads an uncontrolled value (for example a HashTable's `arData` / 64-bit hash),
-   `safe_emalloc` in `php_url_encode` immediately fatals with:
+   `safe_emalloc` in `php_url_encode` immediately raises a fatal error:
    `Possible integer overflow in memory allocation (3 * N + 32)`.
    This is itself a signal that “len is uncontrolled,” but no data is obtained.
 7. Leak A does not produce a dangling `PS(http_session_vars)` reference (`reset_id` fails before
@@ -295,8 +295,8 @@ B: send_b_rce2.py 16 2 0x7ffff5e6e0d8 0x7ffff7d14490 "id>/tmp/p1"
 
 Goal: obtain a libphp code address (for example the HashTable's
 `pDestructor = ZVAL_PTR_DTOR`), and combine it with the known chunk base and g18's
-Zend-only payload (`zif_system`, libphp + `0x43a870`) to achieve **fully HTTP-only,
-no-external-address** ASLR-on RCE.
+Zend-only payload (`zif_system`, libphp + `0x43a870`) to achieve ASLR-on RCE **using only HTTP,
+without externally supplied addresses**.
 
 Confirmed experimental facts:
 
