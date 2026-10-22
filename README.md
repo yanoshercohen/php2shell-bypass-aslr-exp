@@ -1,7 +1,7 @@
 # php2shell - Official environment, no `display_errors` required, `memory_limit` unchanged
 
-Unofficial English translation of [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp), based on upstream commit [`17e98ee`](https://github.com/9bie/php2shell-bypass-aslr-exp/commit/17e98ee81025cccfd94b4f9c9a17bf269c65ff75).
-The original research and code are by 9bie; the English translation is by [Yan O. Cohen](https://github.com/yanoshercohen).
+Unofficial English translation of [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp).
+The original research and code are by 9bie.
 
 **Under the official prefork configuration (`MaxRequestWorkers=150`)**, with a fully remote target, HTTP only, a target page that contains nothing but `<?php echo "OK\n"; ?>`, and no PHP written on the target side, a single command achieves RCE:
 
