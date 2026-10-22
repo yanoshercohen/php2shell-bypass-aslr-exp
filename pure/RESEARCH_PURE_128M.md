@@ -32,7 +32,7 @@ to avoid conflicts with other work in `de0/` and `tools/`.
      8-character names), chunked send → 500.
    - B: `mk_leak_b.py --spec "A:0x137"×24 --fake-len 0x2000 --tag`,
      chunked send → **200 OK**, `Set-Cookie` decodes to 8192 bytes:
-     `/02BBBBB` + 8184 bytes of heap residual from A's era, containing
+     `/02BBBBB` + 8184 bytes of heap contents left over from request A, containing
      62 in-chunk pointers.
    - The read length can be increased to 0x80000 (512KB) and 0xC8000 (800KB);
      responses of 1.5–2.3MB still return normally; pointers cluster on 2MiB
@@ -159,7 +159,7 @@ slot6/slot8/slot14):
 
 - `last_key` = pointer to the next free slot (mapped) → release performs only
   one subtraction;
-- `basedir` = retained A-era "/tmp" pointer;
+- `basedir` = retained "/tmp" pointer from request A;
 - `efree(md)` lands on a SRUN page of bin-40 → safe;
 - Key additional condition: **the refcount of basedir must not be 1**,
   otherwise `zend_string_release_ex(basedir)` will efree onto a FRUN page of a
@@ -326,7 +326,7 @@ lands in `/out/p1`.
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-- Single-worker baseline **20/20**: on the symbol-build debug image, the same
+- Single-worker baseline **20/20**: on the debug image with debug symbols, the same
   worker 8 times in a row, 7 fresh containers each with `--restart`;
   additionally 5/5 on the **stock official image
   `php:8.4.26-apache`** (no gdb/symbols installed, only copying the official

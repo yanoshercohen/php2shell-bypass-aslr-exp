@@ -1,5 +1,8 @@
 # php2shell - Official environment, no `display_errors` required, `memory_limit` unchanged
 
+Unofficial English translation of [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp), based on upstream commit [`17e98ee`](https://github.com/9bie/php2shell-bypass-aslr-exp/commit/17e98ee81025cccfd94b4f9c9a17bf269c65ff75).
+The original research and code are by 9bie; the English translation is by [Yan O. Cohen](https://github.com/yanoshercohen).
+
 **Under the official prefork configuration (`MaxRequestWorkers=150`)**, with a fully remote target, HTTP only, a target page that contains nothing but `<?php echo "OK\n"; ?>`, and no PHP written on the target side, a single command achieves RCE:
 
 - stock official image + official ini + official workers: **10/10**
@@ -10,7 +13,7 @@
 
 In principle, as long as you calculate the offsets for every PHP version and then use them to fuzz in bulk, one of the fuzz runs will eventually achieve RCE. Besides, a crashed worker restarts anyway, so there is no fear of taking the target down.
 
-Regarding workers: the official prefork `MaxRequestWorkers=150` setup has also been completed. The script first occupies 149 workers with incomplete requests, then pins A1/B1/A2/B2 to the same remaining child; the single-worker setup was only an early debugging form (`--workers 1` still reproduces it).
+The chain also works with the official prefork configuration (`MaxRequestWorkers=150`). The script first occupies 149 workers with incomplete requests, then pins A1/B1/A2/B2 to the same remaining child process; the single-worker setup was used for early debugging (`--workers 1` can still be used to reproduce the chain).
 
 ## Quick start (official php.ini-production / display_errors=Off / 128M)
 
@@ -47,7 +50,7 @@ prints the effective ini and MPM values. `--single` mounts the single-worker
 `docker/apache.conf` instead (use it with `--workers 1`). On Linux without
 docker-group permissions, the script automatically falls back to `sudo docker`;
 you can also explicitly run `DOCKER="sudo docker" ./pure/run_pure.sh`. `--dbg`
-only switches to the symbolic build of the same build for offline calibration.
+only switches to the same build with debug symbols for offline calibration.
 
 Common options:
 
@@ -109,8 +112,8 @@ Offsets (this build, ASLR-independent):
 
 Target environment: Debian 13 (trixie), Apache 2.4.69 prefork, PHP 8.4.26 NTS
 mod_php, files session handler. Changing the PHP build/version requires
-recalibrating the offsets; ASLR changes on every container start, and the two
-leaks in the chain derive it automatically.
+recalibrating the offsets. ASLR randomizes the base addresses on every container
+start; the two leaks in the chain determine those addresses automatically.
 
 ## Evidence
 
@@ -129,7 +132,7 @@ unrelated to the official-configuration target in this README; it has been
 archived at [archive/legacy-8m/exploit.py](archive/legacy-8m/exploit.py).
 Documents in the same directory, such as
 [HTTP_HEAP_LEAK.md](archive/legacy-8m/HTTP_HEAP_LEAK.md) and
-[ASLR_PURE_HTTP.md](archive/legacy-8m/ASLR_PURE_HTTP.md), describe that line.
+[ASLR_PURE_HTTP.md](archive/legacy-8m/ASLR_PURE_HTTP.md), describe that earlier approach.
 
 ## Reproduction statement
 

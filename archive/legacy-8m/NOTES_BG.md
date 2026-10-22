@@ -1,6 +1,6 @@
-# New root cause: pre-RINIT `BG(unserialize)` cross-request residual UAF (pure HTTP line)
+# New root cause: pre-RINIT `BG(unserialize)` cross-request residual UAF (pure HTTP research track)
 
-This file records the new exploit chain provided by the user and this line's independent reproduction progress. **The earlier custom-PHP exploitation via `session_unset`/`session_encode` is no longer considered a valid result** (it violates the "no target-specific PHP, fully remote" requirement), and the relevant pages have been moved out of the webroot.
+This file records the new exploit chain provided by the user and the independent reproduction progress for this research track. **The earlier custom-PHP exploitation via `session_unset`/`session_encode` is no longer considered a valid result** (it violates the "no target-specific PHP, fully remote" requirement), and the relevant pages have been moved out of the webroot.
 
 ---
 
@@ -102,7 +102,7 @@ If `data->last` is attacker-controlled, the write address is:
 
 ---
 
-## 3. This line's pure-HTTP reproduction progress
+## 3. Pure-HTTP reproduction progress for this research track
 
 ### 3.1 Prerequisite: create a large session via upload-progress (pure HTTP)
 
@@ -225,7 +225,7 @@ end
 
 - The custom-PHP exploitation via `session_unset`/`session_encode` in Sections 3/10 of `NOTES.md` is **no longer a valid deliverable**; it demonstrated Defect D/leak mechanisms but violates the current constraint of "no target-side-specific PHP, pure HTTP".
 - The old exploit pages have been moved to `~/php-lab/offline/`, and the webroot retains only a plain `index.php`.
-- The new line continues to be based on the `BG(unserialize)` UAF; the next core step is the precise layout of the 8216 structure fields and the two-level `var_push` write.
+- The new approach continues to be based on the `BG(unserialize)` UAF; the next core step is the precise layout of the 8216 structure fields and the two-level `var_push` write.
 
 ---
 
