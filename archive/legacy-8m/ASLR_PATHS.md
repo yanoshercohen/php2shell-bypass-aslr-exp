@@ -1,91 +1,91 @@
-# ASLR 路径分析：纯 Zend 绕过 vs. 地址泄漏
+# ASLR Path Analysis: Zend-Only Bypass vs. Address Leak
 
-日期：2026-10-21
-前提：no-ASLR 纯 HTTP RCE 已打通（`NOASLR_REPORT.md`）。
-约束：**完全远程、纯 HTTP；不构造目标侧特定 PHP**。目标页面只有
-普通 `echo`（无 session 调用）。
+Date: 2026-10-21
+Premise: no-ASLR HTTP-only RCE is already working (`NOASLR_REPORT.md`).
+Constraints: **fully remote, HTTP-only; no target-specific PHP is constructed on the target side**. The target page has only a
+plain `echo` (no session calls).
 
-本文只分析 ASLR 打开后的两条路径，不把旧的自定义 PHP 泄漏/ROP 结果当作有效交付。
+This document analyzes only the two paths with ASLR enabled and does not treat the old custom-PHP leak/ROP results as a valid deliverable.
 
 ---
 
-## 0. 结论摘要
+## 0. Executive Summary
 
-| 路径 | 当前判断 | 主要阻塞 |
+| Path | Current assessment | Main blocker |
 |---|---|---|
-| 路径一：纯 Zend、无泄漏绕过 | 未找到可靠原语 | 所有可控写入都以 NUL 结尾；partial overwrite 会固定写坏一个 ASLR 相关字节；没有已知的固定函数地址 |
-| 路径二：纯 HTTP 地址泄漏 | 默认配置下未找到可用入口 | 默认 `session.serialize_handler=php` 拒绝含 `\|` 的 session key；旧泄漏需要 `php_serialize` + 用户态 `__serialize` 重入 |
+| Path 1: Zend-only, leakless bypass | No reliable primitive found | All controllable writes are NUL-terminated; a partial overwrite deterministically corrupts one ASLR-relevant byte; no known fixed function address |
+| Path 2: HTTP-only address leak | No usable entry point found under the default configuration | The default `session.serialize_handler=php` rejects session keys containing `\|`; the old leak requires `php_serialize` plus userland `__serialize` reentrancy |
 
-在“默认 php.ini + vanilla session 页面”条件下，目前没有把 ASLR 打通。
-下面给出已做的实验、源码依据和下一步可验证的突破口。
+Under the conditions of “default php.ini + vanilla session page,” ASLR has not yet been bypassed.
+The experiments performed, source-code evidence, and next verifiable avenues are given below.
 
 ---
 
-## 1. 现有原语回顾
+## 1. Review of Existing Primitives
 
-no-ASLR 链的关键写原语：
+The key write primitive of the no-ASLR chain:
 
-1. A 请求 OOM，留下悬空 `PS(http_session_vars)` zend_reference（R0）。
-2. B 请求的 56B 原始值缓冲区可覆盖 R0，写入：
-   - `R0+0x00` gc：refcount=1, type=IS_REFERENCE
-   - `R0+0x08` val.value：任意 8 字节指针
-   - `R0+0x10` val.type：0x307 (IS_ARRAY_EX)
-   - `R0+0x18` sources：0
-3. dtor 路径：
+1. Request A OOMs, leaving a dangling `PS(http_session_vars)` zend_reference (R0).
+2. Request B's 56B raw value buffer can overwrite R0, writing:
+   - `R0+0x00` gc: refcount=1, type=IS_REFERENCE
+   - `R0+0x08` val.value: an arbitrary 8-byte pointer
+   - `R0+0x10` val.type: 0x307 (IS_ARRAY_EX)
+   - `R0+0x18` sources: 0
+3. dtor path:
    `zend_delete_global_variable` → `zval_ptr_dtor` →
    `zend_reference_destroy` → `zend_array_destroy(val.value)` →
-   `zend_hash_destroy` → `pDestructor(&bucket->val)`。
-4. 承载 fake HashTable 的最佳位置是**存活的 192B zend_string** 的 data
-   （L=167），因为它不会被 free-list 的 next 指针覆盖 gc；内容是字段值，
-   从 data+0 开始可控。
+   `zend_hash_destroy` → `pDestructor(&bucket->val)`.
+4. The best location for hosting the forged HashTable is the data of a **live 192B zend_string**
+   (L=167), because its gc is not overwritten by the free-list next pointer; the contents are field values,
+   controllable starting at data+0.
 
-因此 ASLR 下缺的是：`val.value`（堆地址）和/或 `pDestructor`（libc/libphp
-代码地址）。
+Thus, under ASLR, what is missing is `val.value` (a heap address) and/or `pDestructor` (a libc/libphp
+code address).
 
 ---
 
-## 2. 路径一：纯 Zend、无泄漏 ASLR 绕过
+## 2. Path 1: Zend-Only ASLR Bypass Without a Leak
 
-目标：不使用任何泄漏，直接构造出对 ASLR 不敏感的指针/函数指针。
+Goal: without using any leak, directly construct pointers/function pointers that are insensitive to ASLR.
 
-### 2.1 方案 A：复用旧 reference 的 val.value = A0（真实 session HashTable）
+### 2.1 Option A: Reuse the old reference's val.value = A0 (the real session HashTable)
 
-- A 中旧 reference 的 `val.value` 指向真实 session HashTable A0。
-  no-ASLR 实测 A0 = `0x7ffff5e03268`（`R0+0xf48`）。
-- 如果 B 不覆盖 R0 的 val.value，而是让 A0 的内存变成攻击者可控的
-  fake HashTable，就不需要知道堆基址。
-- 可行性检查：
-  - A0 是 56B 的 HashTable 结构（sizeof(zend_array)=56，bin 6）。
-  - A0 的 `pDestructor` 原本是 `ZVAL_PTR_DTOR`（libphp 指针）。
-  - 需要 A0 被一个**存活**的、内容可控的分配重占，且 `gc.type == IS_ARRAY`。
-  - 但 B 中内容可控的分配有两类：
-    1. `multipart_buffer_read_body` 的 raw value buffer：在字段处理完就被
-       `efree()`；释放后 allocator 会把 `next_free_slot` 写到块 offset 0，
-       覆盖 gc，导致 `GC_DELREF` 不归零，不会进入 array dtor。
-    2. 存活的 zend_string：gc type 是 IS_STRING（6），`rc_dtor_func` 会调用
-       `zend_string_destroy`，不是 `zend_array_destroy`。
-  - 存活的真实 HashTable 有正确 type=7，但 `pDestructor` 是真实的
-    `ZVAL_PTR_DTOR`，我们无法在不改变 gc 的情况下改它。
-- 结论：A0 复用需要一个“存活、可控、type=IS_ARRAY”的分配，目前没有。
+- The old reference's `val.value` in A points to the real session HashTable A0.
+  Under no-ASLR, measurement gives A0 = `0x7ffff5e03268` (`R0+0xf48`).
+- If B does not overwrite R0's val.value but instead makes A0's memory into an attacker-controlled
+  forged HashTable, the heap base does not need to be known.
+- Feasibility check:
+  - A0 is a 56B HashTable structure (sizeof(zend_array)=56, bin 6).
+  - A0's `pDestructor` is originally `ZVAL_PTR_DTOR` (a libphp pointer).
+  - A0 would need to be reoccupied by a **live** allocation with controllable contents and `gc.type == IS_ARRAY`.
+  - However, B has two classes of allocations with controllable contents:
+    1. The raw value buffer from `multipart_buffer_read_body`: it is `efree()`d as soon as the field is processed;
+       after free, the allocator writes `next_free_slot` at block offset 0, overwriting gc, so `GC_DELREF` does
+       not reach zero and the array dtor is not entered.
+    2. A live zend_string: its gc type is IS_STRING (6), and `rc_dtor_func` calls
+       `zend_string_destroy`, not `zend_array_destroy`.
+  - A live real HashTable has the correct type=7, but its `pDestructor` is the real
+    `ZVAL_PTR_DTOR`; we cannot change it without changing gc.
+- Conclusion: reusing A0 requires a “live, controllable, type=IS_ARRAY” allocation, which is not currently available.
 
-### 2.2 方案 B：partial pointer overwrite（保留 libphp 高字节）
+### 2.2 Option B: Partial pointer overwrite (preserving the high bytes of libphp)
 
-思路：把 A0 的 `pDestructor` 从 `ZVAL_PTR_DTOR` 改成 libphp 内另一个
-函数/ gadget，只覆盖低 2–3 字节，保留 libphp 基址高字节。这样不需要泄漏。
+Idea: change A0's `pDestructor` from `ZVAL_PTR_DTOR` to another function/gadget inside libphp,
+overwriting only the low 2–3 bytes and preserving the high bytes of the libphp base. This requires no leak.
 
-需要解决两个问题：
+Two problems need to be solved:
 
-1. **能否写到 A0+0x30 且只覆盖低字节？**
-   - 字符串/raw buffer 的写总是带一个 NUL：
-     `zend_string_init` 在 data[len] 写 0；`multipart_buffer_read_body`
-     在 out[total] 写 0。
-   - 若从 `pDestructor` 开始写 N 字节，则第 N 字节一定是 0。
-   - 例如覆盖低 2 字节：`b0,b1` 可控，`b2=0`；覆盖低 3 字节：`b0..b2`
-     可控，`b3=0`。
-   - 目标 libphp 地址的高字节中，`b3/b4/b5` 都带 ASLR 随机性；强制为 0
-     只有在目标绝对地址对应字节本来就为 0 时才成立。这依赖基址，不可靠。
-2. **能否找到 2–3 字节范围内的有用 target？**
-   - 已实测当前构建的 libphp 符号（未 strip）：
+1. **Can we write to A0+0x30 and overwrite only the low bytes?**
+   - String/raw buffer writes always include a NUL:
+     `zend_string_init` writes 0 at data[len]; `multipart_buffer_read_body`
+     writes 0 at out[total].
+   - If N bytes are written starting at `pDestructor`, byte N is necessarily 0.
+   - For example, to overwrite the low 2 bytes, `b0,b1` are controllable and `b2=0`; to overwrite the low 3 bytes,
+     `b0..b2` are controllable and `b3=0`.
+   - In the high bytes of the target libphp address, `b3/b4/b5` all carry ASLR randomness; forcing them to 0
+     holds only if the corresponding byte of the target absolute address is already 0. This depends on the base and is unreliable.
+2. **Can we find a useful target within a 2–3 byte range?**
+   - Measured symbols in the current libphp build (unstripped):
      ```text
      zif_system          0x43a870
      zend_call_function  0x566d20
@@ -93,77 +93,76 @@ no-ASLR 链的关键写原语：
      zend_array_destroy  0x5cbdc0
      zval_ptr_dtor       0x613c50
      ```
-   - `zval_ptr_dtor` 与 `zend_call_function` 相距 0xacf30（约 700KB），
-     与 `zif_system` 相距 0x1d93e0（约 1.9MB）。
-   - 低 2 字节 partial overwrite 只能在同 64KB 内跳转；低 3 字节加上
-     强制 NUL 的 b3=0 又依赖基址字节。当前没有落在同一 64KB 的可用
-     gadget。
-   - libphp 只导入 `popen`（`objdump -T` 可见），没有导入 `system`；
-     `popen@plt` 也需要 libphp 基址，且第二次参数 rsi 不可控。
-   - 旧情报的 `zend_call_function → zif_system` 需要 fake FCI，属于需要
-     libphp 基址的另一条链。
+   - `zval_ptr_dtor` is 0xacf30 (about 700KB) away from `zend_call_function` and
+     0x1d93e0 (about 1.9MB) away from `zif_system`.
+   - A low-2-byte partial overwrite can only jump within the same 64KB; the low-3-byte case, with the forced
+     NUL at b3=0, again depends on the base byte. There is currently no usable
+     gadget that falls in the same 64KB.
+   - libphp imports only `popen` (`objdump -T` shows this) and does not import `system`;
+     `popen@plt` also requires the libphp base, and the second argument, rsi, is not controllable.
+   - The earlier `zend_call_function → zif_system` lead requires a forged FCI and belongs to
+     another chain that needs the libphp base.
 
-结论：partial overwrite 是目前最接近“纯 Zend”思路的方向，但 NUL 终止符
-是硬阻塞；除非找到**不带终止符的任意长度前缀写**。
+Conclusion: partial overwrite is currently the closest direction to the “Zend-only” idea, but the NUL
+terminator is a hard blocker unless an **arbitrary-length prefix write without a terminator** can be found.
 
-### 2.3 方案 C：allocator 自写指针（free-list next / shadow）
+### 2.3 Option C: Allocator self-written pointer (free-list next / shadow)
 
-- 释放块的 offset 0 有明文 `next_free_slot`（堆指针），offset size-8 有
-  XOR 编码的 shadow。
-- 如果把 fake reference 的 val.value 放在某个释放块的 `next_free_slot`
-  位置，allocator 会替我们写一个真实堆指针。
-- 但该指针指向**另一个释放块的起点**，其 offset 0 又是 next 指针，
-  不是合法的 array gc；`GC_DELREF` 不会归零。
-- 对齐上，R0+8 要成为某个 bin 的 slot 起点；在 R0=0x...2320 时，
-  R0+8=0x...2328 只有 8B bin 能整除（页内偏移 0x328=808=8×101），
-  8B 块没有可控内容。
-- 结论：不能直接得到“指向可控 fake HashTable 的堆指针”。
+- A freed block has a plaintext `next_free_slot` (heap pointer) at offset 0 and an
+  XOR-encoded shadow at offset size-8.
+- If the forged reference's val.value is placed at the `next_free_slot` position of a freed block,
+  the allocator writes a real heap pointer for us.
+- However, this pointer points to the **start of another freed block**, whose offset 0 is again a next pointer,
+  not a valid array gc; `GC_DELREF` does not reach zero.
+- For alignment, R0+8 must become the start of a slot in some bin; when R0=0x...2320,
+  R0+8=0x...2328 is divisible only by the 8B bin (page offset 0x328=808=8×101),
+  and 8B blocks have no controllable contents.
+- Conclusion: a heap pointer to a controllable forged HashTable cannot be obtained directly.
 
-### 2.4 方案 D：固定地址代码
+### 2.4 Option D: Code at a fixed address
 
-- Apache 主程序是 PIE（`file /usr/sbin/apache2` = pie executable），
-  `libphp.so`、libc 都受 ASLR。
-- 唯一固定可执行页是 vsyscall `0xffffffffff600000`，只有
-  gettimeofday/time/getcpu，不能任意 syscall/RCE。
-- 主程序/模块都没有可直接用的 `system@popen@execve` 固定 PLT（已检查
-  导入；且 PIE 基址随机）。
-- 结论：没有固定代码地址可用。
+- The main Apache program is PIE (`file /usr/sbin/apache2` = pie executable),
+  and `libphp.so` and libc are both subject to ASLR.
+- The only fixed executable page is vsyscall at `0xffffffffff600000`, which provides only
+  gettimeofday/time/getcpu and cannot perform arbitrary syscalls/RCE.
+- Neither the main program nor the modules have a directly usable fixed PLT for `system@popen@execve` (imports
+  checked; the PIE base is also randomized).
+- Conclusion: no fixed code address is available.
 
-### 2.5 路径一小结
+### 2.5 Path 1 Summary
 
-在现有原语下，纯 Zend 无泄漏绕过需要以下之一：
+With the existing primitives, a Zend-only leakless bypass requires one of the following:
 
-- **不带 NUL 的 partial write**（可改 A0->pDestructor 低字节且保留高字节）；
-- **存活、可控、type=IS_ARRAY 的分配**（可重占 A0）；
-- **allocator 自写指针 + 可控内容**的组合；
-- 某个可在同一 64KB 内完成攻击的 libphp 真实函数指针。
+- **A partial write without a NUL** (able to change the low bytes of A0->pDestructor while preserving the high bytes);
+- **A live, controllable allocation of type=IS_ARRAY** (able to reoccupy A0);
+- **A combination of an allocator self-written pointer and controllable contents**;
+- A real libphp function pointer that can complete the attack within the same 64KB.
 
-这些目前都未被证实。下一步最值得做的是测量 libphp 内
-`zval_ptr_dtor` 附近 64KB 的 gadget/函数，并寻找是否有“写 N 字节不带
-终止符”的 PHP 分配路径。
+None of these has been confirmed yet. The most worthwhile next step is to measure the gadgets/functions within
+64KB of `zval_ptr_dtor` in libphp and search for a PHP allocation path that “writes N bytes without a terminator.”
 
 ---
 
-## 3. 路径二：纯 HTTP 地址泄漏
+## 3. Path 2: HTTP-Only Address Leak
 
-目标：把堆 chunk base / libphp base / libc base 泄漏到 HTTP 响应，
-再由 no-ASLR 链动态计算地址。
+Goal: leak the heap chunk base / libphp base / libc base into the HTTP response,
+then dynamically compute addresses with the no-ASLR chain.
 
-### 3.1 默认配置下的 session 序列化器限制（已实验）
+### 3.1 Session Serializer Restrictions Under the Default Configuration (Tested)
 
-默认：
+Defaults:
 
 ```ini
 session.serialize_handler = php
 session.use_only_cookies = 1
 ```
 
-默认 `php` encoder 在写每个 session key 前：
+Before writing each session key, the default `php` encoder:
 
 ```c
 smart_str_appendl(&buf, ZSTR_VAL(key), ZSTR_LEN(key));
 if (memchr(ZSTR_VAL(key), PS_DELIMITER, ZSTR_LEN(key))) {
-    /* key 含 '|'：放弃整个 encode，返回 NULL */
+    /* key contains '|': abandon the entire encode and return NULL */
     fail = true;
     break;
 }
@@ -171,7 +170,7 @@ smart_str_appendc(&buf, PS_DELIMITER);
 php_var_serialize(&buf, struc, &var_hash);
 ```
 
-实测（gdb `ps_files_write`）：
+Measured (gdb `ps_files_write`):
 
 ```text
 progress key = upload_progress_X|E:20:"AAAAAAAAAAAAAAAAAAAA";
@@ -179,11 +178,11 @@ FWRITE key=injtest0005 klen=11 vlen=0
 php_session_decode len=0
 ```
 
-即：progress key 含 `|` 时，encoder 直接返回 NULL，session 写为空；
-END cleanup 读到的 session data 长度为 0。**默认配置下无法用 key 注入
-任意 serialized 数据。**
+That is, when the progress key contains `|`, the encoder returns NULL directly and the session write is empty;
+the session data length read by END cleanup is 0. **Under the default configuration, arbitrary serialized
+data cannot be injected via the key.**
 
-默认 decoder 也不是 C 字符串解析：
+The default decoder does not parse the data as a C string either:
 
 ```c
 while (*q != PS_DELIMITER) {
@@ -191,247 +190,245 @@ while (*q != PS_DELIMITER) {
 }
 ```
 
-NUL 不能绕过 `|` 分隔符。
+NUL cannot bypass the `|` delimiter.
 
-### 3.2 旧泄漏原语的依赖（不满足当前约束）
+### 3.2 Dependencies of the Old Leak Primitive (Not Satisfied by the Current Constraints)
 
-`NOTES.md` 第 10 节的两个泄漏都依赖：
+Both leaks in Section 10 of `NOTES.md` depend on:
 
-1. `session.serialize_handler = php_serialize`（非默认；脚本 `ini_set` 或
-   应用配置）。
-2. 用户态类 `C::__serialize()` 在 encode 过程中释放 `$_SESSION` 数组，
-   再用 `zend_reference`/`stream_bucket_new` 重占，制造 encoder 的 UAF。
-3. 应用调用 `session_encode()` 并把结果输出/保存在可读位置。
+1. `session.serialize_handler = php_serialize` (non-default; set by a script via `ini_set` or by
+   application configuration).
+2. A userland class `C::__serialize()` freeing the `$_SESSION` array during encoding and then
+   reoccupying it with `zend_reference`/`stream_bucket_new`, creating a UAF in the encoder.
+3. The application calls `session_encode()` and outputs/stores the result in a readable location.
 
-当前目标页面只有普通 `echo`，没有用户态类，也没有 `session_encode()`
-输出；默认 handler 又是 `php`。因此这两条泄漏在本约束下不可达。
+The current target page has only a plain `echo`, no userland classes, and no `session_encode()` output;
+the default handler is also `php`. Therefore, these two leaks are unreachable under the present constraints.
 
-### 3.3 纯 HTTP 下可控的 session 数据面
+### 3.3 Session Data Plane Controllable via HTTP Only
 
-默认配置里，attacker 能影响并进入 session 文件的只有：
+Under the default configuration, the only attacker-influenced data that can enter the session file is:
 
-- progress key（key 名，不能含 `|`）；
-- progress data 数组的固定键/值：
+- the progress key (the key name, which cannot contain `|`);
+- the fixed keys/values of the progress data array:
   `start_time`, `content_length`, `bytes_processed`, `done`,
   `files[0].field_name`, `files[0].name`, `files[0].tmp_name`,
   `files[0].error`, ...
-- 其中 `field_name`/`name` 是 attacker 字符串，但作为**序列化值**
-  （`s:<len>:"...";`）写入，binary-safe，不能变成 key 或 enum。
+- Here `field_name`/`name` are attacker strings, but they are written as **serialized values**
+  (`s:<len>:"...";`), are binary-safe, and cannot become keys or enums.
 
-session decoder 读到的结构由 PHP 自己生成；没有 attacker 可控的
-`E:`/`O:`/`C:`/`R:` 语法，也没有跨变量注入。
+The structure read by the session decoder is generated by PHP itself; there is no attacker-controlled
+`E:`/`O:`/`C:`/`R:` syntax and no cross-variable injection.
 
-### 3.4 候选泄漏点与阻塞
+### 3.4 Candidate Leak Points and Blockers
 
-| 候选 | 结果 |
+| Candidate | Result |
 |---|---|
-| progress key 注入 serialized `E:` → enum warning `%.*s` | 默认 `php` encoder 拒绝含 `\|` 的 key；写入 0 字节 |
-| `E:` 长度越界读 | `maxlen < len` 检查，len 被输入缓冲区长度限制 |
-| session file 作为泄漏载体 | 需要先有 encoder OOB 写；默认 encoder 没有 |
-| `unserialize` 内置类 handler 的 OOB/警告 | 默认配置无法注入 `O:`/`C:`；progress data 只有数组/字符串 |
-| 错误信息 `%p`/指针格式 | session/unserialize 路径没有 `%p`；只有 enum 的 `%.*s` |
-| `session_start` 警告打印 id/path（仅在应用调用时才有此候选） | 不含内存地址；id 字符受限 |
-| `/proc/self/maps` | 需要目标侧 PHP 读文件，违反约束 |
+| Injecting serialized `E:` via the progress key → enum warning `%.*s` | The default `php` encoder rejects keys containing `\|`; writes 0 bytes |
+| `E:` length out-of-bounds read | A `maxlen < len` check; len is limited by the input buffer length |
+| Session file as a leak carrier | Requires an encoder OOB write first; the default encoder has none |
+| `unserialize` built-in class handler OOB/warnings | The default configuration cannot inject `O:`/`C:`; progress data contains only arrays/strings |
+| Error message `%p`/pointer format | The session/unserialize paths have no `%p`; only the enum `%.*s` |
+| `session_start` warning printing id/path (this candidate exists only when the application calls it) | Contains no memory address; id characters are restricted |
+| `/proc/self/maps` | Requires target-side PHP to read a file, violating the constraints |
 
-### 3.5 如果允许改 php.ini（不是应用 PHP）
+### 3.5 If Modifying php.ini Is Allowed (Not Application PHP)
 
-把 `session.serialize_handler` 改成 `php_serialize` 后：
+After changing `session.serialize_handler` to `php_serialize`:
 
-- progress key 里的 `|` 不再被 encoder 拒绝（`php_serialize` 用
-  `php_var_serialize` 序列化整个数组，不检查 key 的 `|`）；
-- 可以用 key 注入额外 session 变量，触发 decode warning/内置类 handler；
-- 但旧的两个泄漏仍需要“encode 期间释放 session 数组”的重入，而
-  vanilla 页面没有这个重入。
+- The `|` in the progress key is no longer rejected by the encoder (`php_serialize` uses
+  `php_var_serialize` to serialize the entire array and does not check keys for `|`);
+- Keys can be used to inject additional session variables, triggering decode warnings/built-in class handlers;
+- However, the two old leaks still require the reentrancy of “freeing the session array during encode,” and
+  a vanilla page does not provide this reentrancy.
 
-因此即使改 INI，也不等于自动有泄漏；还需要一个纯 PHP 内置的
-reentrancy gadget，目前未找到。
-
----
-
-## 4. 两条路径的下一步实验
-
-### 路径一（纯 Zend）
-
-1. **测量 libphp 布局**：`nm -D`/`objdump` 取
-   `zval_ptr_dtor`、`zend_call_function`、`zif_system`、`system@plt`
-   的偏移，确认是否存在同一 64KB/16MB 内的可用 partial target。
-2. **找无终止符写**：检查 `erealloc` 增长、stream bucket、`smart_str`
-   等路径是否有“只复制前缀、不写 NUL”的分配；若有，可对
-   A0->pDestructor 做真正的低字节 partial overwrite。
-3. **A0 存活重占**：尝试在 B 中把 A0（56B HashTable）用**存活**的
-   可控分配重占，且保持 `gc.type=IS_ARRAY`；例如：
-   - 用 session decode 生成真实小数组，落在 A0；
-   - 再用一个只覆盖 pDestructor 低字节、不覆盖 gc 的写。
-4. **allocator 指针对齐**：扫 A 的参数（progress key 长度、SID 长度、
-   文件数量/大小）看 R0 是否能移动，使 R0+8 成为更大 bin 的 slot，
-   从而用 free-list next 指针得到“可控指向”的堆指针。
-
-### 路径二（泄漏）
-
-1. **只在默认配置下**枚举所有能把 attacker 字符串输出到 warning 的
-   路径（`php_error` 的 `%s`/`%.*s`），确认是否有长度未校验的
-   `%.*s`。
-2. **内置 `Serializable` 类 handler fuzz**：`ArrayObject`、
-   `SplObjectStorage`、`DateTime`、`SimpleXMLElement`、`ZipArchive`、
-   `Phar` 等的 `unserialize()` C 实现，寻找越界读/把输入打印到 warning
-   的路径。注意默认配置目前无法把 `C:`/`O:` 注入 session，所以这条
-   只在 `php_serialize` 或应用可控 session 数据时才有意义。
-3. **progress data 的值**：确认 `field_name`/`name`/`tmp_name` 是否
-   在任何错误路径被 `%.*s` 打印；目前源码中未找到。
-4. **BG(unserialize) 写原语**：如果能在纯 HTTP 下绕过
-   `serialize_lock` 依赖，`var_push` 的任意写可以伪造一个
-   `zend_string.len`，再触发 `%.*s` warning 泄漏。该链目前因需要
-   应用层 `__wakeup`/autoload 而暂停。
+Therefore, even changing the INI does not automatically provide a leak; a purely PHP built-in
+reentrancy gadget is still needed, and none has been found yet.
 
 ---
 
-## 5. 约束下的判断
+## 4. Next Experiments for Both Paths
 
-- **纯 Zend 无泄漏**：理论上最优雅，但受“NUL 终止符 + 无固定代码地址”
-  限制；目前没有可靠构造。
-- **地址泄漏**：在默认 `php` serializer 下，progress key 注入被
-  encoder 的 `memchr('|')` 直接拒绝；旧泄漏又依赖非默认 serializer +
-  用户态重入。纯 HTTP、无应用代码的泄漏入口尚未找到。
-- 若允许**非默认 php.ini**（`session.serialize_handler=php_serialize`），
-  可以继续研究 key 注入 + 内置类 handler；这仍不是“写特定 PHP”，但
-  已经偏离默认配置。
-- 若允许目标应用存在一个 session 对象/进度端点（应用 gadget），旧的
-  `php_serialize` 泄漏链可以复用；这属于应用层依赖，不符合当前
-  “vanilla session 页面”的约束。
+### Path 1 (Zend-Only)
 
-在严格约束下，当前交付应明确标注为 **no-ASLR RCE**；ASLR 的两条路径
-均未完成，需要上述实验之一取得突破。
+1. **Measure the libphp layout**: use `nm -D`/`objdump` to obtain the offsets of
+   `zval_ptr_dtor`, `zend_call_function`, `zif_system`, and `system@plt`,
+   and confirm whether a usable partial target exists within the same 64KB/16MB.
+2. **Find a terminator-free write**: check whether paths such as `erealloc` growth, stream buckets, and `smart_str`
+   have an allocation that “copies only a prefix and does not write a NUL”; if so, a true low-byte partial overwrite of
+   A0->pDestructor becomes possible.
+3. **Live reoccupation of A0**: in B, try to reoccupy A0 (a 56B HashTable) with a **live**
+   controllable allocation while keeping `gc.type=IS_ARRAY`; for example:
+   - use session decode to create a real small array that lands at A0;
+   - then use a write that overwrites only the low bytes of pDestructor and not gc.
+4. **Allocator pointer alignment**: sweep A's parameters (progress key length, SID length,
+   number and size of files) to see whether R0 can be moved so that R0+8 becomes a slot in a larger bin,
+   thereby using the free-list next pointer to obtain a heap pointer with a “controllable target.”
+
+### Path 2 (Leak)
+
+1. **Under the default configuration only**, enumerate all paths that can output attacker strings
+   in warnings (`%s`/`%.*s` in `php_error`) and confirm whether any `%.*s` lacks a length check.
+2. **Fuzz built-in `Serializable` class handlers**: the `unserialize()` C implementations of `ArrayObject`,
+   `SplObjectStorage`, `DateTime`, `SimpleXMLElement`, `ZipArchive`,
+   `Phar`, etc., looking for out-of-bounds reads/paths that print input in warnings.
+   Note that the default configuration currently cannot inject `C:`/`O:` into the session, so this line
+   is meaningful only with `php_serialize` or application-controllable session data.
+3. **Progress data values**: confirm whether `field_name`/`name`/`tmp_name` are
+   printed by `%.*s` on any error path; none has been found in the source so far.
+4. **BG(unserialize) write primitive**: if the `serialize_lock` dependency can be bypassed over HTTP only,
+   the arbitrary write in `var_push` could forge a `zend_string.len` and then trigger a
+   `%.*s` warning leak. This chain is currently paused because it requires application-layer
+   `__wakeup`/autoload.
 
 ---
 
-## 6. 追加：固定 Zend 偏移实测（2026-10-21）
+## 5. Assessment Under the Constraints
 
-用户提示“Zend 有些地址可能是固定的”后，做了以下测量。
+- **Zend-only, leakless**: theoretically the most elegant, but limited by the “NUL terminator + no fixed code address”
+  constraint; there is currently no reliable construction.
+- **Address leak**: under the default `php` serializer, progress-key injection is rejected directly by
+  the encoder's `memchr('|')`; the old leak also depends on a non-default serializer plus
+  userland reentrancy. No leak entry point has yet been found that is HTTP-only and requires no application code.
+- If a **non-default php.ini** is allowed (`session.serialize_handler=php_serialize`),
+  key injection plus built-in class handlers can be investigated further; this still is not “writing target-specific PHP,” but it
+  has already departed from the default configuration.
+- If the target application is allowed to have a session object/progress endpoint (an application gadget), the old
+  `php_serialize` leak chain can be reused; this is an application-layer dependency and does not meet the current
+  “vanilla session page” constraint.
 
-### 6.1 固定偏移
+Under the strict constraints, the current deliverable should be explicitly labeled **no-ASLR RCE**; neither ASLR path
+is complete, and one of the above experiments must achieve a breakthrough.
 
-ASLR 开启（`randomize_va_space=2`）下，用 A/B 触发在
-`php_session_track_init` 读取：
+---
 
-- 旧 reference R0 = **chunk + 0x2320**，三次 master 重启均如此。
-- session HashTable A0（R0->val.value）：
-  - A 的 PHPSESSID 长度 8..32：A0 = **chunk + 0x3268**
-  - A 的 PHPSESSID 长度 1..5：A0 = **chunk + 0x3230**
-- Zend main chunk 基址 2MB 对齐。
-- 同一 Apache master 下，连续 kill -9 worker 5 次，新 worker 的 chunk
-  基址完全不变（例：`0x7fa32de00000`，B=7）。即：
-  - **一个 master 生命周期内 chunk 基址固定**；
-  - 但 master 重启才重新随机化，worker 崩溃不能重试 B。
+## 6. Addendum: Measurements of Fixed Zend Offsets (2026-10-21)
 
-### 6.2 chunk header 不是代码跳板
+After the user noted that “some Zend addresses may be fixed,” the following measurements were performed.
 
-dump chunk+0x000..0x100：
+### 6.1 Fixed Offsets
 
-- `heap`/`next`/`prev`/`free_slot[]` 全是堆指针；
-- `size`/`peak`/`chunks_count`/`pid` 是小整数；
-- 没有 libphp/libc 代码指针。
-- 1 字节 partial write 只能把旧 val.value 指向 `chunk+0x00XX`，
-  正好落在 header，没有可用 pDestructor；2 字节 partial write 会
-  清零 b2（16MB 块内 2MB 索引低 3 位），实测该槽是库的只读
-  `.eh_frame` 数据，不是可控 Zend chunk。
+With ASLR enabled (`randomize_va_space=2`), the A/B trigger was used to read the following at
+`php_session_track_init`:
 
-### 6.3 A0 的旧内容
+- The old reference R0 = **chunk + 0x2320**, consistently across three master restarts.
+- Session HashTable A0 (R0->val.value):
+  - A's PHPSESSID length 8..32: A0 = **chunk + 0x3268**
+  - A's PHPSESSID length 1..5: A0 = **chunk + 0x3230**
+- The Zend main chunk base is 2MB-aligned.
+- Under the same Apache master, after killing the worker with kill -9 5 times in a row, the fresh worker's chunk
+  base was completely unchanged (example: `0x7fa32de00000`, B=7). That is:
+  - **The chunk base is fixed for the lifetime of a master**;
+  - but it is re-randomized only when the master restarts, so a worker crash cannot retry B.
 
-A0=chunk+0x3268 处的旧 HashTable：
+### 6.2 The Chunk Header Is Not a Code Trampoline
+
+Dump of chunk+0x000..0x100:
+
+- `heap`/`next`/`prev`/`free_slot[]` are all heap pointers;
+- `size`/`peak`/`chunks_count`/`pid` are small integers;
+- there are no libphp/libc code pointers.
+- A 1-byte partial write can only make the old val.value point to `chunk+0x00XX`,
+  which lands exactly in the header and has no usable pDestructor; a 2-byte partial write
+  zeroes b2 (the low 3 bits of the 2MB index within a 16MB block), and measurement shows that slot is the library's read-only
+  `.eh_frame` data, not a controllable Zend chunk.
+
+### 6.3 Old Contents of A0
+
+The old HashTable at A0=chunk+0x3268:
 
 ```text
-A0+0x00 gc        = 0xffffffff00000106   (refcount 不是 1)
+A0+0x00 gc        = 0xffffffff00000106   (refcount is not 1)
 A0+0x10 arData    = chunk+0x33c0
-A0+0x30 pDestructor = libphp zval_ptr_dtor (真实代码指针)
+A0+0x30 pDestructor = libphp zval_ptr_dtor (real code pointer)
 ```
 
-因为 refcount 不是 1，不覆盖 val.value 时 dtor 只减引用，不会进入
-`zend_array_destroy`；所以之前必须伪造 reference。
+Because the refcount is not 1, when val.value is not overwritten, the dtor only decrements the reference
+and does not enter `zend_array_destroy`; therefore, a reference had to be forged previously.
 
-### 6.4 新原语：二进制 PHPSESSID 写入 A0 的 gc
+### 6.4 New Primitive: Writing A0's gc with a Binary PHPSESSID
 
-- `php_session_valid_key()` 用 C 字符串扫描；PHPSESSID 值可以是
-  `validprefix\0<binary>`，NUL 之后的二进制仍会进入
-  `progress->sid` / `PS(id)` 的 zend_string。
-- `PS(id)` 是直接 `zend_string_init`，其 raw 值缓冲先释放，随后
-  320B 的 PS(id) 会复用该 slot。
-- 实测：SID 长度 280、`sidvalid\0...` + 在 SID offset 0x110 放
-  fake gc，B 的 track_init 时 **A0 第一个 qword 变成
-  `0x0000000700000001`**，完全不需要知道 chunk 基址。
-- 该 320B 存活字符串位于 page3 slot 0x3140（data 0x3158），
-  A0=0x3268 正好是 data+0x110。
-- 这意味着：**gc（refcount=1, type=IS_ARRAY）可以相对 A0 写入**。
+- `php_session_valid_key()` scans as a C string; the PHPSESSID value can be
+  `validprefix\0<binary>`, and the binary after the NUL still enters the
+  zend_string of `progress->sid` / `PS(id)`.
+- `PS(id)` is created directly with `zend_string_init`; its raw value buffer is freed first, and
+  the 320B PS(id) then reuses that slot.
+- Measurement: with SID length 280, `sidvalid\0...`, and a forged gc placed at SID offset 0x110,
+  at B's track_init **A0's first qword becomes `0x0000000700000001`**, with no need to know the chunk base at all.
+- This 320B live string is located at page3 slot 0x3140 (data 0x3158),
+  and A0=0x3268 is exactly data+0x110.
+- This means that **gc (refcount=1, type=IS_ARRAY) can be written relative to A0**.
 
-### 6.5 仍未解决：pDestructor / arData
+### 6.5 Still Unresolved: pDestructor / arData
 
-- A0=0x3268 时，pDestructor 在 A0+0x30=0x3298，已经跨到**下一个
-  320B slot**（0x3280）；实测该处被 B 的 320B  allocation 覆盖成
-  `0xffff...`，旧真实 `zval_ptr_dtor` 丢失。
-- 若把 A 的 SID 改到 1..5，A0=0x3230，pDestructor 落在同一个
-  320B slot 内；但：
-  - 要覆盖/控制 gc/flags/arData，320B 字符串长度需 ≥257，而
-    pDestructor 在 data offset 0x108=264，字符串 copy 会**完整覆盖**
-    pDestructor（无法保留高字节）；
-  - 要保留 pDestructor，长度需 ≤263，此时 arData（data offset
-    0xd8+0x10=232）已被覆盖，必须写入一个绝对指针，而基址未知；
-  - 想只覆盖 gc/flags 不碰 arData，需要 L<232，但 320B bin 要求
-    L≥257；bin 大小与 copy 长度耦合，无法做到。
-- 8B header key 方案也失败：R0+8=0x2328 在 page2 内只有 8B slot 101
-  对齐，而 page2 被启动期 56B 分配占据（MAP2=bin6），不是 bin0；
-  且 8B 块的 free-list shadow 本来就覆盖整 8 字节，无法保留旧高字节。
+- When A0=0x3268, pDestructor is at A0+0x30=0x3298, which has already crossed into the **next
+  320B slot** (0x3280); measurement shows that B's 320B allocation overwrites this location with
+  `0xffff...`, losing the old real `zval_ptr_dtor`.
+- If A's SID is changed to 1..5, A0=0x3230 and pDestructor falls within the same
+  320B slot; however:
+  - To overwrite/control gc/flags/arData, the 320B string length must be ≥257, while
+    pDestructor is at data offset 0x108=264, so the string copy **completely overwrites**
+    pDestructor (the high bytes cannot be preserved);
+  - To preserve pDestructor, the length must be ≤263, but then arData (data offset
+    0xd8+0x10=232) has already been overwritten and an absolute pointer must be written, while the base is unknown;
+  - To overwrite only gc/flags without touching arData, L<232 is required, but the 320B bin requires
+    L≥257; the bin size is coupled to the copy length, so this cannot be done.
+- The 8B header-key approach also fails: R0+8=0x2328 is aligned only to 8B slot 101 within page2,
+  while page2 is occupied by startup-time 56B allocations (MAP2=bin6), not bin0;
+  moreover, the free-list shadow of an 8B block already covers all 8 bytes, so the old high bytes cannot be preserved.
 
-### 6.6 结论
+### 6.6 Conclusion
 
-固定 Zend 偏移是真实的、可用的：
+The fixed Zend offsets are real and usable:
 
-- R0、A0、fake HT 相对 chunk 的偏移固定；
-- 同一 master 内 chunk 基址固定；
-- 旧的真实 `zval_ptr_dtor` 指针位于 A0+0x30。
+- the offsets of R0, A0, and the forged HT relative to the chunk are fixed;
+- the chunk base is fixed within the same master;
+- the old real `zval_ptr_dtor` pointer is located at A0+0x30.
 
-但仅靠这些仍不能绕过 ASLR，因为：
+However, these alone still cannot bypass ASLR because:
 
-1. 需要一个**不写 NUL、只改前缀**的 partial write 才能保留
-   pDestructor 高字节；
-2. 或者需要把 arData 指向一个**绝对地址可控**的 fake bucket；
-3. 当前所有可用写都是“整段 copy + NUL 结尾”，且 bin 几何固定，
-   上述两种都未构造出来。
+1. a partial write that **does not write a NUL and changes only a prefix** is needed to preserve
+   pDestructor's high bytes;
+2. or arData must be made to point to a forged bucket whose **absolute address is controllable**;
+3. all currently available writes are “copy the entire segment + NUL terminator,” and the bin geometry is fixed,
+   so neither of the above has been constructed.
 
-下一步最值得继续的是：
-- 用 A 参数把 A0 移到某个地址，使“字符串 data 结束于 pDestructor+1”
-  与 bin/slot 几何同时成立（目前 0x3230/0x3268 都不成立）；
-- 或找到任意一个“只写 N 字节、不带终止符”的 Zend 分配/复制路径；
-- 或先泄漏 chunk 基址（同一 master 内固定，一次泄漏可复用）。
+The most worthwhile next steps are:
+- use A's parameters to move A0 to an address where “the string data ends at pDestructor+1”
+  and the bin/slot geometry hold simultaneously (currently neither 0x3230 nor 0x3268 satisfies this);
+- or find any Zend allocation/copy path that “writes only N bytes without a terminator”;
+- or first leak the chunk base (fixed within the same master, so one leak can be reused).
 
 ---
 
-## 7. 追加：A0 形态与 page3 bin 实测
+## 7. Addendum: A0 Shapes and page3 bin Measurements
 
-### 7.1 A0 不只两个值
+### 7.1 A0 Has More Than Two Values
 
-细扫 A 的 PHPSESSID 长度（no-ASLR，page3 固定 320B bin）：
+Detailed sweep of A's PHPSESSID length (no-ASLR, page3 with a fixed 320B bin):
 
-| A SID 长度 | A0（chunk 偏移） | A0+0 处 gc | A0+0x30 |
+| A SID length | A0 (chunk offset) | gc at A0+0 | A0+0x30 |
 |---|---|---|---|
-| 1–13 | `0x3230` | `0x80000000005978e8`（不是 array HashTable） | `0x7ffff5e61208` |
-| 14–21 | `0x3268` | `0xffffffff00000106`（refcount 巨大） | 真实 `zval_ptr_dtor` |
-| 22–23, 32–40 | `0x3230` | 同上 | 不是 pDestructor |
-| **24–30** | **`0x3310`** | **`0xc000040700000001`**（rc=1，type=IS_ARRAY） | **真实 `zval_ptr_dtor`** |
+| 1–13 | `0x3230` | `0x80000000005978e8` (not an array HashTable) | `0x7ffff5e61208` |
+| 14–21 | `0x3268` | `0xffffffff00000106` (huge refcount) | real `zval_ptr_dtor` |
+| 22–23, 32–40 | `0x3230` | same as above | not pDestructor |
+| **24–30** | **`0x3310`** | **`0xc000040700000001`** (rc=1, type=IS_ARRAY) | **real `zval_ptr_dtor`** |
 
-`0x3310` 是首次出现的“本身就可作为 HashTable 使用”的 A0：
+`0x3310` is the first A0 that “can itself be used as a HashTable”:
 
 ```text
 A0=chunk+0x3310
 A0+0x00 = 0xc000040700000001   gc: rc=1, type=IS_ARRAY
-A0+0x10 = chunk+0x4900/0x4540  arData（真实堆指针）
-A0+0x30 = libphp zval_ptr_dtor（真实代码指针）
+A0+0x10 = chunk+0x4900/0x4540  arData (real heap pointer)
+A0+0x30 = libphp zval_ptr_dtor (real code pointer)
 ```
 
-也就是说，**不需要伪造 gc/flags**，stale reference 的 val.value=A0、
-`zend_array_destroy(A0)` 就会走真实 array 路径。
+That is, **gc/flags do not need to be forged**; with the stale reference's val.value=A0,
+`zend_array_destroy(A0)` follows the real array path.
 
-### 7.2 page3 的 bin 是固定的
+### 7.2 The page3 Bin Is Fixed
 
-在 ASLR/no-ASLR 下，B 的 chunk page map 始终是：
+Under ASLR/no-ASLR, B's chunk page map is always:
 
 ```text
 page1 bin3 (32B)
@@ -440,8 +437,8 @@ page3-7 bin16 (320B)
 page8-12 bin20 (640B)
 ```
 
-用自定义请求头 `X-Pad: A*N`（N=0/96/320/480/700/1000）测试，page map 完全不变。
-gdb 在 `zend_mm_alloc_small_slow` 上抓第一次 320B 分配：
+Testing with the custom request header `X-Pad: A*N` (N=0/96/320/480/700/1000) leaves the page map completely unchanged.
+gdb catches the first 320B allocation at `zend_mm_alloc_small_slow`:
 
 ```text
 zend_mm_alloc_small_slow(bin_num=16)
@@ -451,12 +448,12 @@ zend_mm_alloc_small_slow(bin_num=16)
   zend_hash_add
 ```
 
-第一次 640B 分配是同一个 HashTable 的 `zend_hash_do_resize`。所以 page3
-的 320B bin 是启动期 HashTable arData 固定分配的，**不能靠请求头/字段改变**。
+The first 640B allocation is `zend_hash_do_resize` for the same HashTable. Therefore, the 320B bin on page3
+is a fixed startup-time allocation for HashTable arData and **cannot be changed via request headers/fields**.
 
-### 7.3 320B slot 几何与 A0=0x3310
+### 7.3 320B Slot Geometry and A0=0x3310
 
-A0=0x3310 位于 page3 的 320B slot2（block `0x3280`，data `0x3298`）：
+A0=0x3310 is in page3's 320B slot2 (block `0x3280`, data `0x3298`):
 
 ```text
 A0 = 0x3310 = slot2 data + 0x78
@@ -465,25 +462,22 @@ nNumUsed     = A0+0x18 = slot2 data + 0x90
 pDestructor  = A0+0x30 = slot2 data + 0xa8
 ```
 
-- 一个 320B zend_string 在 slot2 的 data 从 0x3298 开始，长度只能是 232..295。
-- 要覆盖/控制 pDestructor（data offset 0xa8=168），必须用长度 ≥168 的 copy；
-  但 320B bin 的最小长度是 232，所以 copy **必然同时覆盖 arData**
-  （offset 0x88=136）和前面的 gc/flags。
-- 要只 NUL pDestructor 字节0（保留高字节），需要 L=168；这对应
-  alloc=193 → **224B bin**，不能占用 320B slot2。
-- 要保留 arData（不覆盖），需要 L<136；更不可能占用 320B slot。
-- 因此 A0=0x3310 虽然 gc 合法，但仍然被“copy 长度 vs bin 大小”卡住：
-  无法在保留 arData 的同时对 pDestructor 做 partial overwrite。
+- A 320B zend_string in slot2 has data starting at 0x3298, and its length can only be 232..295.
+- To overwrite/control pDestructor (data offset 0xa8=168), a copy of length ≥168 is required;
+  but the minimum length for the 320B bin is 232, so the copy **necessarily also overwrites arData**
+  (offset 0x88=136) and the preceding gc/flags.
+- To NUL only byte 0 of pDestructor (preserving the high bytes), L=168 is required; this corresponds to
+  alloc=193 → **224B bin**, which cannot occupy 320B slot2.
+- To preserve arData (not overwrite it), L<136 is required, making it even less possible to occupy a 320B slot.
+- Therefore, although A0=0x3310 has a valid gc, it is still constrained by “copy length vs bin size”:
+  pDestructor cannot be partially overwritten while arData is preserved.
 
-### 7.4 当前判断
+### 7.4 Current Assessment
 
-- 固定 Zend 偏移确实存在，并且 A0=0x3310 提供了一个真实的、rc=1 的
-  可控起点；
-- 但 page3 的 320B bin 固定，320B slot 的 data 长度窗口（232..295）
-  与 A0 内部字段偏移（arData 136、pDestructor 168）不匹配；
-- 仍然缺一个“只写前缀、不带 NUL”的写原语，或者一个能让
-  arData 指向受控数据的相对指针。
+- Fixed Zend offsets do exist, and A0=0x3310 provides a real, controllable starting point with rc=1;
+- but the 320B bin on page3 is fixed, and the data length window of a 320B slot (232..295)
+  does not match A0's internal field offsets (arData 136, pDestructor 168);
+- a write primitive that “writes only a prefix without a NUL” is still missing, as is a relative pointer that can make
+  arData point to controlled data.
 
-这条线目前没有闭环；no-ASLR RCE 仍是唯一已验证的代码执行。
-
-
+This line of work is not yet closed; no-ASLR RCE remains the only verified code execution.

