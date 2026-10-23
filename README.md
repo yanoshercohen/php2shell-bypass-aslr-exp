@@ -1,5 +1,7 @@
 # php2shell - Official environment, no `display_errors` required, `memory_limit` unchanged
 
+English | [Japanese](readme_ja.md) | [Chinese (upstream)](https://github.com/9bie/php2shell-bypass-aslr-exp/blob/main/README.md)
+
 Unofficial English translation of [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp).
 The original research and code are by 9bie.
 
